@@ -1,0 +1,5 @@
+/bin/
+/state/
+*.test
+coverage.out
+.DS_Store

@@ -1,0 +1,48 @@
+/* RepoDeploy panel styles. Served from /static so the CSP can forbid inline styles. */
+:root{font:16px/1.5 system-ui,sans-serif;color:#15232c;background:#f4f6f8}
+*{box-sizing:border-box}
+body{max-width:1120px;margin:auto;padding:24px}
+a{color:#155ea0}
+header{display:flex;justify-content:space-between;align-items:center;margin-bottom:32px}
+h1,h2{line-height:1.2}
+section,details,.card{background:white;border:1px solid #d7dfe6;border-radius:10px;padding:24px;margin:20px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px}
+label{display:block;font-weight:600}
+input,select{display:block;width:100%;padding:10px;border:1px solid #a8b5c0;border-radius:5px;font:inherit;margin:5px 0 12px}
+button{background:#175d88;color:white;border:0;border-radius:5px;padding:10px 16px;cursor:pointer;font:inherit}
+button:hover{background:#12486a}
+button.secondary{background:#435563}
+.actions{display:flex;gap:12px;flex-wrap:wrap}
+.actions form{margin:0}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:10px;border-bottom:1px solid #dde4ea;vertical-align:top}
+.scroll{overflow-x:auto}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101e2a;color:#e0edf5;padding:20px;border-radius:8px;min-height:120px}
+code{overflow-wrap:anywhere}
+small,.muted{color:#526371}
+.notice{border-left:4px solid #b77b05;padding:12px;background:#fff5d6}
+.success{border-left:4px solid #2c7a3f;padding:12px;background:#e3f4e7}
+summary{cursor:pointer;font-weight:600}
+fieldset{border:1px solid #d7dfe6;border-radius:8px;padding:16px;margin:0 0 16px;min-width:0}
+legend{font-weight:700;padding:0 6px}
+.choice{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:12px}
+label.inline{display:flex;gap:8px;align-items:center}
+label.inline input{width:auto;margin:0}
+.build-compose{display:none}
+form:has(input[name=build_type][value=compose]:checked) .build-compose{display:grid}
+form:has(input[name=build_type][value=compose]:checked) .build-dockerfile{display:none}
+[aria-invalid=true]{border-color:#b3261e;box-shadow:0 0 0 2px #b3261e}
+.button-link{padding:10px 16px}
+:focus-visible{outline:3px solid #edab39;outline-offset:3px}
+.brand{font-size:24px;font-weight:700;text-decoration:none}
+.narrow{max-width:420px;margin:60px auto}
+textarea{display:block;width:100%;padding:10px;border:1px solid #a8b5c0;border-radius:5px;font:14px/1.4 ui-monospace,monospace;margin:5px 0 12px}
+nav.actions{align-items:center}
+.status{display:inline-block;font-weight:600;border-radius:999px;padding:2px 10px;font-size:14px;margin:0 0 8px}
+.status.ok{background:#e3f4e7;color:#1d5c2e}
+.status.failed{background:#fbe4e2;color:#8c1d14}
+.status.running{background:#e2edf7;color:#16466f}
+.danger{border-color:#e3b7b2}
+button.danger{background:#a3271c}
+button.danger:hover{background:#7f1d15}
+.card h2{margin-top:0}

@@ -1,0 +1,47 @@
+[Unit]
+Description=RepoDeploy Git deployment service
+Requires=docker.service
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=repodeploy
+Group=repodeploy
+SupplementaryGroups=docker
+WorkingDirectory=/var/lib/repodeploy
+ExecStart=/usr/local/bin/repodeploy --state /var/lib/repodeploy serve --listen 127.0.0.1:8081
+UMask=0077
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=210
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/repodeploy
+# Defense in depth. Membership of the docker group remains root-equivalent;
+# these settings limit what the daemon, Git and SSH can do directly.
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
