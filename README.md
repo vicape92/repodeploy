@@ -2,35 +2,54 @@
   <img src="docs/assets/hero.jpg" alt="RepoDeploy: from Git to your servers" width="100%">
 </p>
 
-<h3 align="center">Push to Git. Ship to your own server. No pipeline required.</h3>
+<h3 align="center">Your own app platform. Push code or upload a folder, set your variables, ship.</h3>
 
 <p align="center">
   <a href="#4-installation">Install</a> ·
-  <a href="#5-first-run">First run</a> ·
+  <a href="#6-tutorial-your-first-deployment">Tutorial</a> ·
+  <a href="#manual-upload-no-git">Upload a folder</a> ·
+  <a href="#environment-variables">Variables</a> ·
   <a href="#13-cli-reference">CLI</a> ·
-  <a href="#14-project-configuration-reference">Configuration</a> ·
   <a href="docs/installation.md">Docs</a>
 </p>
 
-**RepoDeploy turns any Linux box into your own deployment platform.** Connect a
-GitHub, Bitbucket or SSH repository, pick a branch, and every push becomes a
-safe, zero-drama release: RepoDeploy checks out that exact commit, builds it
-with Docker or Docker Compose *while your current version keeps serving*,
-health-checks the new one, and only then switches over. If anything fails, the
-previous version is restored automatically and the log tells you why.
+**RepoDeploy turns any Linux machine, a VPS, a cloud server or the box under
+your desk, into a self-hosted application platform.** Install it once, and from
+then on shipping an app is a push or a single command: no servers to
+hand-configure per app, no pipelines to write, no secrets in your repository.
 
-One static binary gives you the daemon, a polished web panel and a scriptable
-CLI. No GitHub Actions minutes, no SaaS account, no hosted database, no
-external registry: your code, your server, your rules.
+- **Deploy from Git:** connect GitHub, Bitbucket or any SSH repository, pick a
+  branch, and every push becomes a release, by webhook or polling, optionally
+  after your CI checks pass.
+- **…or deploy a folder:** no repository needed. Run `repodeploy up` in your
+  project folder, from the server or from your laptop, or upload a `.zip` from
+  the panel.
+- **Configuration that never touches Git:** set environment variables per
+  project in the panel or the CLI, import an existing `.env` in one go, choose
+  which values the build may see, and apply changes with one **Deploy changes**
+  click.
 
-- **Git-native:** signed GitHub webhooks, polling or one-click deploys, with
-  optional waiting for your CI/CD checks.
+Every release is built with Docker or Docker Compose *while the current version
+keeps serving*, health-checked, and only then switched over. If anything fails,
+the previous version comes back automatically and the live log tells you why.
+Rolling back restores the code **and** the variables that release ran with.
+
+```sh
+repodeploy env import "$APP" .env       # your settings, outside Git
+repodeploy up --project "$APP"          # pack this folder, deploy it, stream the log
+```
+
+One static binary gives you the daemon, a polished web panel, a scriptable CLI
+and a JSON API. No SaaS account, no per-seat or usage billing, no hosted
+database, no external registry: your code, your server, your rules.
+
 - **Safe by default:** build-before-switch, health checks, automatic recovery
   and one-click rollback to any retained release.
-- **Batteries included:** live streamed logs, Compose secrets management,
-  browser sign-in for GitHub and Bitbucket, and a guided SSH key assistant.
-- **Self-hosted and hardened:** strict CSP, throttled logins, sandboxed systemd
-  unit and containers with `no-new-privileges`.
+- **Batteries included:** live streamed logs, environment variables and Compose
+  secrets, browser sign-in for GitHub and Bitbucket, a guided SSH key
+  assistant, and validated, content-addressed uploads.
+- **Self-hosted and hardened:** strict CSP, throttled logins, secrets redacted
+  from logs, a sandboxed systemd unit and containers with `no-new-privileges`.
 
 Network access is still needed to reach your repositories and pull base images.
 
@@ -49,8 +68,9 @@ Network access is still needed to reach your repositories and pull base images.
 # User manual
 
 The rest of this document is the complete guide: what RepoDeploy does, how to
-install it, how to deploy your first application, and how to use every part
-of the panel, the CLI and the API, with worked examples.
+install it, how to deploy your first application from Git or from a folder,
+how to configure it with environment variables, and how to use every part of
+the panel, the CLI and the API, with worked examples.
 
 ## Contents
 
@@ -61,11 +81,11 @@ of the panel, the CLI and the API, with worked examples.
 5. [First run](#5-first-run)
 6. [Tutorial: your first deployment](#6-tutorial-your-first-deployment)
 7. [Preparing your repository](#7-preparing-your-repository)
-8. [Connecting repositories](#8-connecting-repositories)
+8. [Connecting repositories and uploading code](#8-connecting-repositories-and-uploading-code)
 9. [Triggers: manual, polling, webhooks and CI/CD](#9-triggers-manual-polling-webhooks-and-cicd)
 10. [Using the web panel](#10-using-the-web-panel)
 11. [Releases, rollback and recovery](#11-releases-rollback-and-recovery)
-12. [Secrets and configs](#12-secrets-and-configs)
+12. [Environment variables, secrets and configs](#12-environment-variables-secrets-and-configs)
 13. [CLI reference](#13-cli-reference)
 14. [Project configuration reference](#14-project-configuration-reference)
 15. [HTTP API](#15-http-api)
@@ -83,19 +103,21 @@ API.
 
 | Term | Meaning |
 | --- | --- |
-| **Project** | One Git repository, one branch, and how to build, run and health-check it. |
-| **Deployment** (job) | One attempt to ship one exact commit of a project. It has an ID, a phase, a log and a duration. |
-| **Release** | A successful deployment. Its images and Compose manifest are retained, so it can be restored later without Git or a rebuild. A release ID is the ID of the deployment that produced it. |
+| **Project** | One application: where its code comes from, how to build, run and health-check it, and its environment variables. |
+| **Source** | Where a project's code comes from, chosen when it is created: a **Git** repository and branch, or **uploaded** archives (a folder sent with `repodeploy up` or a `.zip`/`.tar.gz` from the panel). |
+| **Deployment** (job) | One attempt to ship one exact commit or upload of a project. It has an ID, a phase, a log and a duration. |
+| **Release** | A successful deployment. Its images and Compose manifest, including the variable values it was built with, are retained, so it can be restored later without Git or a rebuild. A release ID is the ID of the deployment that produced it. |
 | **Active release** | The release currently running for a project. |
-| **Trigger** | What queues a deployment: the **Deploy** button or CLI (manual), polling, or a GitHub webhook. |
+| **Environment variables** | Per-project settings such as `DATABASE_URL`, stored on the host, never in Git, and injected at deployment time. |
+| **Trigger** | What queues a deployment: the **Deploy** button or CLI (manual), polling, a GitHub webhook, an upload, or **Deploy changes** after editing variables. |
 | **Worker** | A single queue that runs deployments one at a time, for all projects. The panel and the CLI share it. |
-| **State directory** | `/var/lib/repodeploy`: database, credentials, secrets, release manifests and logs. |
+| **State directory** | `/var/lib/repodeploy`: database, credentials, secrets and variables, upload archives, release manifests and logs. |
 
 ## 2. How a deployment works
 
 ```mermaid
 flowchart LR
-    T["Trigger<br/>push · poll · manual"] --> Q[queued]
+    T["Trigger<br/>push · poll · manual · upload"] --> Q[queued]
     Q --> W{Wait for CI/CD?}
     W -- yes --> CI[waiting_ci]
     W -- no --> P[preparing]
@@ -108,13 +130,17 @@ flowchart LR
     B -- build error --> F["failed<br/>nothing changed"]
 ```
 
-1. A webhook, a poll, or a manual request **queues** a deployment for the
-   current head of the configured branch.
-2. Optionally, RepoDeploy **waits for the commit's CI/CD checks** to pass.
-3. The exact commit is checked out into an isolated release directory
-   (**preparing**).
-4. Images are **built** while the current version keeps serving traffic. If the
-   build fails, nothing running is touched.
+1. A webhook, a poll, a manual request or an upload **queues** a deployment
+   for an exact target: the current head of the configured branch, or the
+   uploaded archive. **Deploy changes** queues the active release's commit or
+   upload again, to apply edited variables.
+2. Optionally, for Git projects, RepoDeploy **waits for the commit's CI/CD
+   checks** to pass.
+3. The exact commit is checked out, or the stored upload extracted, into an
+   isolated release directory (**preparing**). The project's environment
+   variables are read and recorded with the release.
+4. Images are **built** with those variables while the current version keeps
+   serving traffic. If the build fails, nothing running is touched.
 5. The new version is started (**activating**) and **health-checked**.
 6. On success it becomes the active release and old releases beyond the
    retention limit are pruned. On failure the previous release is restored and
@@ -146,7 +172,7 @@ records what happened to the application:
   [reproducible build](docs/installation.md#reproducible-build).
 
 macOS and Windows daemons are not supported. The CLI also builds on macOS and
-can manage a remote daemon.
+can manage a remote daemon, including uploading folders with `repodeploy up`.
 
 Check the host before installing:
 
@@ -276,9 +302,10 @@ It refuses token files readable by group or others.
 
 This walkthrough uses [`examples/app`](examples/app), a tiny BusyBox web server
 with a Dockerfile, a Compose healthcheck, a persistent volume and switches to
-simulate failures. In about ten minutes you will deploy it, ship a change,
-watch a failed release get rolled back automatically, and restore a release by
-hand.
+simulate failures. In about fifteen minutes you will deploy it from Git, ship a
+change, watch a failed release get rolled back automatically, restore a release
+by hand, then deploy the same folder without Git and drive it with environment
+variables.
 
 ### Step 1: put the example in a repository
 
@@ -398,16 +425,72 @@ repodeploy resume PROJECT_ID               # re-enable automatic deployments
 A manual rollback **pauses** automation so the next push does not undo it.
 Resume when you are ready.
 
+### Step 7: deploy a folder without Git
+
+Create an **upload project** for the same example, this time in Dockerfile mode
+on port 18081 so it can run next to the first one.
+
+**In the panel:** on the dashboard click **Upload a project**, name it
+`hello-upload`, keep **Dockerfile**, set host port `18081`, container port
+`8080` and health URL `http://127.0.0.1:18081/health`, and save. On the project
+page, upload a `.zip` of the `hello-repodeploy` folder.
+
+**Or with the CLI:** save this as `hello-upload.json`:
+
+```json
+{
+  "name": "hello-upload",
+  "source": "upload",
+  "dockerfile": "Dockerfile",
+  "port": 18081,
+  "container_port": 8080,
+  "health_url": "http://127.0.0.1:18081/health"
+}
+```
+
+```sh
+repodeploy add --file hello-upload.json         # prints the project and its "id"
+cd hello-repodeploy
+repodeploy up --project PROJECT_ID              # packs the folder, uploads it, streams the log
+```
+
+The first `up` saves the project ID in `.repodeploy/project`; from then on, edit
+`version.txt` and run plain `repodeploy up` to ship the folder again.
+
+### Step 8: drive it with environment variables
+
+In Dockerfile mode every project variable reaches the container. The example
+app reads `FAIL_HEALTH`, so set it and apply it:
+
+```sh
+printf '1' | repodeploy env set PROJECT_ID FAIL_HEALTH
+repodeploy deploy-changes PROJECT_ID
+```
+
+The project page showed **Undeployed changes** as soon as the variable was
+saved; **Deploy changes** rebuilt the active upload with the new value. The
+health check fails and the previous release is restored, exactly as in step 5,
+but this time without touching the code. The restored release was built
+without the variable, so the banner stays until you remove it:
+
+```sh
+repodeploy env unset PROJECT_ID FAIL_HEALTH     # stored values match the active release again
+```
+
+Real applications use the same flow for `DATABASE_URL`, API keys and feature
+flags; see [Environment variables](#environment-variables).
+
 ## 7. Preparing your repository
 
 Every project uses exactly one build type: a **Dockerfile** or a **Compose
-file**. Paths are relative to the repository root.
+file**. Paths are relative to the root of the repository or uploaded folder.
 
 ### Dockerfile mode
 
 RepoDeploy builds the image, runs one container, publishes `port` on the host
 (mapped to `container_port`), and calls an HTTP health URL that must answer
-`2xx` without redirects.
+`2xx` without redirects. Every project
+[environment variable](#environment-variables) is passed to the container.
 
 Example repository, a small Node.js service listening on port 3000:
 
@@ -455,7 +538,8 @@ services:
     ports:
       - "127.0.0.1:18080:8080"      # always write the host IP
     environment:
-      DATABASE_URL: "postgres://app@db/app"
+      DATABASE_URL: ${DATABASE_URL}            # project variable, set in RepoDeploy
+      LOG_LEVEL: ${LOG_LEVEL:-info}            # with a default
     depends_on: [db]
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
@@ -511,9 +595,16 @@ reproducible and confined to the host's rules:
 Every service also gets `no-new-privileges` and capped `json-file` logs. The
 full rules are in [docs/operations.md](docs/operations.md).
 
-## 8. Connecting repositories
+## 8. Connecting repositories and uploading code
 
-Open **Connections** in the panel.
+A project's code comes from one of two sources, chosen when you create it:
+
+- **A Git repository:** connect it from **Connections** in the panel, as
+  described below. Pushes can deploy automatically.
+- **Uploads:** no repository at all. You send the folder yourself; see
+  [Manual upload](#manual-upload-no-git).
+
+Open **Connections** in the panel to connect a repository.
 
 <p align="center"><img src="docs/assets/screenshots/connections.png" alt="Repository connections" width="85%"></p>
 
@@ -535,7 +626,8 @@ are not supported.
 ### Manual upload (no Git)
 
 A project can deploy code you upload instead of a Git repository: useful for
-prototypes, code that is not on a Git host, or a quick test.
+prototypes, client work that lives in a folder, code that is not on a Git host,
+or shipping straight from your laptop.
 
 1. On the dashboard choose **Upload a project**, give it a name and the same
    build and health settings as any project, and save.
@@ -584,6 +676,10 @@ Polling can skip intermediate commits when several land between checks; it
 always deploys the latest head. A failed automatic target is not retried
 automatically: push a fix or deploy manually.
 
+Upload projects have no detection mode: each upload queues its own deployment.
+For every project, **Deploy changes** (`repodeploy deploy-changes`) redeploys
+the active release with the current environment variables.
+
 ### Set up a GitHub webhook
 
 1. Set the project's mode to `webhook` or `both`.
@@ -622,13 +718,14 @@ The panel follows your system's light or dark theme and works on phones.
 
 ### Projects (dashboard)
 
-Every project appears as a card with its latest deployment state, repository,
-branch, detection mode, build type and active release. Cards also flag
-**Automation paused**, **Recovery failed · blocked** and **Polling failing**.
-While a deployment runs, the dashboard refreshes itself every 10 seconds
-(unless you are typing in a form).
+Every project appears as a card with its latest deployment state, source
+(repository and branch, or **Manual upload**), detection mode, build type and
+active release. Cards also flag **Automation paused**, **Recovery failed ·
+blocked** and **Polling failing**. While a deployment runs, the dashboard
+refreshes itself every 10 seconds (unless you are typing in a form).
 
 - **Connect a repository** opens the connection assistants.
+- **Upload a project** creates a project that deploys uploaded folders.
 - **Advanced: Git URL and existing SSH files** creates a project from a plain
   Git URL.
 
@@ -638,20 +735,23 @@ While a deployment runs, the dashboard refreshes itself every 10 seconds
 
 | Area | What you can do |
 | --- | --- |
-| **Deploy branch** | Queue a deployment of the branch's current head. |
+| **Deploy branch** | Git projects: queue a deployment of the branch's current head. |
 | **Resume automation** | Shown after a rollback; re-enables automatic deployments. |
-| **Summary** | Branch, detection, build type and active release. |
-| **Deployment history** | Every deployment with its commit, time, duration and state. **Restore** brings back any successful release. |
+| **Summary** | Branch and detection (or **Manual upload**), build type and active release. |
+| **Upload a new version** | Upload projects: send a `.zip` or `.tar.gz` (up to the `--max-upload` limit), optionally redeploying an archive identical to the active release. The form also shows the matching `repodeploy up` command. |
+| **Deployment history** | Every deployment with its commit (or `upload` hash), time, duration and state. **Restore** brings back any successful release. |
+| **Environment variables** | Values are masked; **Show** reveals one on its own page. Add or replace a variable, tick **Also available at build time** when the build needs it, delete one, or **Paste a .env file** to import many. When the active release runs with different values, an **Undeployed changes** banner offers **Deploy changes**. |
 | **Secrets and configs** | Store, replace or delete values for Compose `external` secrets; see which ones the active release requires and which are missing. |
-| **Project settings** | Edit every option of the project. Changes apply to new deployments. |
-| **GitHub webhook** | Shows the endpoint and generates or rotates the signing secret. |
-| **Delete project** | Stops the app and removes its containers, images, history, logs and secrets. Type the name to confirm; tick the box to also delete its volumes. |
+| **Project settings** | Edit every option of the project. Changes apply to new deployments. A project's source cannot change. |
+| **GitHub webhook** | Git projects: shows the endpoint and generates or rotates the signing secret. |
+| **Delete project** | Stops the app and removes its containers, images, history, logs, secrets, variables and uploads. Type the name to confirm; tick the box to also delete its volumes. |
 
 ### Deployment page
 
-Shows the state, commit, recovery result and duration, and streams the log
-live until the deployment finishes. Logs are capped at 1 MiB per deployment,
-and known secret values are replaced by `[REDACTED]`.
+Shows the state, commit or upload hash, recovery result and duration, and
+streams the log live until the deployment finishes. Logs are capped at 1 MiB
+per deployment, and known secret and variable values are replaced by
+`[REDACTED]`.
 
 ### Security
 
@@ -662,27 +762,83 @@ the CLI token (revokes the old token immediately and shows the new one once).
 
 - RepoDeploy keeps the last `retain` releases (1–50, default 5) per project,
   plus the active one. Older images and manifests are pruned; volumes are never
-  deleted by retention.
+  deleted by retention. An upload archive is kept as long as a retained release
+  uses it.
 - **Automatic recovery:** if a new release fails to start or fails its health
   check, the previous release is started again and checked. If that also
   fails, the project is **blocked** and automation pauses until you restore a
   release yourself.
 - **Manual rollback** reuses the retained images, with no Git or build step. It
-  also restores the secrets and configs captured with that release, and pauses
-  automation until you resume it.
+  also restores the environment variables, secrets and configs captured with
+  that release, and pauses automation until you resume it. Afterwards the
+  project page shows **Undeployed changes** if your current variables differ.
 - **Restarts are safe:** after a daemon restart, interrupted builds start over
-  from a fresh checkout of the same commit, and interrupted activations restore
-  the previous release first.
+  from a fresh checkout of the same commit (or a fresh extraction of the same
+  upload), and interrupted activations restore the previous release first.
 
 Health is checked at deployment time only. RepoDeploy does not monitor or roll
 back an application that becomes unhealthy later. The full failure matrix is in
 [docs/operations.md](docs/operations.md#failure-behavior).
 
-## 12. Secrets and configs
+## 12. Environment variables, secrets and configs
 
-Keep credentials out of Git: declare them as `external` in `compose.yaml`
-(see the [Compose example](#compose-mode)), then store the values in
-RepoDeploy.
+Configuration and credentials never need to live in your repository or your
+uploaded folder. RepoDeploy offers two mechanisms:
+
+- **Environment variables** for ordinary settings and most credentials
+  (`DATABASE_URL`, API keys, feature flags). They work in both build types.
+- **Compose secrets and configs** for values your services read as files
+  (certificates, keys, config files), mounted under `/run/secrets`.
+
+### Environment variables
+
+Values such as `DATABASE_URL` are stored per project on this host
+(`STATE/secrets/<project>.env.json`, mode 0600) and never belong in Git.
+
+- **Dockerfile mode:** every variable reaches the container environment.
+- **Compose mode:** reference them as `${NAME}` or `${NAME:-default}` in a
+  service's `environment:` values or `build.args:`, so each service gets only
+  what it asks for. Interpolation anywhere else is still rejected, so variables
+  cannot change images, ports or volumes. An undefined variable without a
+  default fails the deployment before the build. A literal `$` in a value stays
+  literal.
+- **Build time:** a variable reaches the image build only when it is marked
+  *available at build* (`--build`). Build arguments are stored in the image
+  history, so mark only values that are safe to embed, such as
+  `NEXT_PUBLIC_*`.
+
+**In the panel:** project page → **Environment variables** → enter a name and a
+value, tick **Also available at build time** if needed, **Save variable**. Use
+**Paste a .env file** to import many at once (comments, `export` and quoted
+values are understood). Values are masked; **Show** reveals one on its own
+page.
+
+Saving variables restarts nothing. When the active release was built with
+other values, the project page shows **Undeployed changes** with a **Deploy
+changes** button, which rebuilds the active commit or upload with the current
+values. Each release keeps the values it was built with, so restoring an old
+release restores its variables too. Values are redacted from deployment logs.
+
+**With the CLI** (values are read from standard input, never from arguments):
+
+```sh
+repodeploy env set PROJECT_ID DATABASE_URL < db-url.txt
+printf '%s' "$TOKEN" | repodeploy env set PROJECT_ID API_TOKEN
+printf '%s' 'https://api.example.org' | repodeploy env set PROJECT_ID NEXT_PUBLIC_API_URL --build
+repodeploy env import PROJECT_ID .env
+repodeploy env list PROJECT_ID          # names only; --reveal shows values
+repodeploy env unset PROJECT_ID API_TOKEN
+repodeploy deploy-changes PROJECT_ID
+```
+
+Limits: names use letters, digits and `_` (not starting with a digit, up to 100
+characters); values are UTF-8 text up to 64 KiB; up to 500 variables per
+project.
+
+### Secrets and configs
+
+Declare file-based credentials as `external` in `compose.yaml` (see the
+[Compose example](#compose-mode)), then store the values in RepoDeploy.
 
 **In the panel:** project page → **Secrets and configs** → enter the name, paste
 the value or upload a file, **Save secret**.
@@ -704,37 +860,6 @@ printf '%s' 'correct-horse-battery-staple' | repodeploy secret PROJECT_ID db_pas
   encrypted against the host administrator.
 - Maximum size: about 1 MB per value.
 
-### Environment variables
-
-Values such as `DATABASE_URL` are stored per project on this host
-(`STATE/secrets/<project>.env.json`, mode 0600) and never belong in Git.
-
-- **Dockerfile mode:** every variable reaches the container environment.
-- **Compose mode:** reference them as `${NAME}` or `${NAME:-default}` in a
-  service's `environment:` values or `build.args:`. Interpolation anywhere else
-  is still rejected, so variables cannot change images, ports or volumes. An
-  undefined variable without a default fails the deployment before the build.
-- **Build time:** a variable reaches the image build only when it is marked
-  *available at build* (`--build`). Build arguments are stored in the image
-  history, so mark only values that are safe to embed, such as
-  `NEXT_PUBLIC_*`.
-
-Saving variables restarts nothing. When the active release was built with
-other values, the project page shows **Deploy changes**, which rebuilds the
-active commit or upload with the current values. Each release keeps the values
-it was built with, so restoring an old release restores its variables too.
-Values are redacted from deployment logs.
-
-```sh
-repodeploy env set PROJECT_ID DATABASE_URL < db-url.txt
-printf '%s' "$TOKEN" | repodeploy env set PROJECT_ID API_TOKEN
-printf '%s' 'https://api.example.org' | repodeploy env set PROJECT_ID NEXT_PUBLIC_API_URL --build
-repodeploy env import PROJECT_ID .env
-repodeploy env list PROJECT_ID          # names only; --reveal shows values
-repodeploy env unset PROJECT_ID API_TOKEN
-repodeploy deploy-changes PROJECT_ID
-```
-
 ## 13. CLI reference
 
 ```
@@ -755,7 +880,7 @@ they combine well with `jq`.
 | `project ID` | Show a project's settings |
 | `add --file FILE` | Create a project from JSON |
 | `update ID --file FILE` | Replace a project's settings from JSON |
-| `deploy ID` | Queue a deployment of the configured branch |
+| `deploy ID` | Queue a deployment of the configured branch (Git projects) |
 | `deploy-changes ID` | Redeploy the active release with the current variables |
 | `env list ID [--reveal]` | List variables; values only with `--reveal` |
 | `env set ID NAME [--build\|--no-build]` | Store a variable read from standard input |
@@ -793,6 +918,13 @@ JOB=$(repodeploy deploy "$PROJECT" | jq -r .id) && repodeploy logs "$JOB" --foll
 # Show the last five deployments
 repodeploy history "$PROJECT" | jq -r '.[:5][] | "\(.id)  \(.phase)  \(.commit)"'
 
+# Ship the current folder to an upload project (remembers the project afterwards)
+repodeploy up --project "$PROJECT"
+repodeploy up
+
+# Move an existing .env into RepoDeploy, then apply it to the running release
+repodeploy env import "$PROJECT" .env && repodeploy deploy-changes "$PROJECT"
+
 # Change a setting: export, edit, update
 repodeploy project "$PROJECT" > project.json
 jq '.poll_seconds = 30' project.json > project.new.json
@@ -808,8 +940,9 @@ blocked) is not affected.
 
 ## 14. Project configuration reference
 
-Git projects need `name`, `repo`, `branch` and `mode`; upload projects need `name` and `"source": "upload"`. Both need the fields of one
-build type:
+Git projects need `name`, `repo`, `branch` and `mode`; upload projects need
+`name` and `"source": "upload"` and must not set Git, polling or CI/CD fields.
+Both need the fields of one build type:
 
 - **Dockerfile:** `dockerfile`, `port`, `container_port` and `health_url`.
 - **Compose:** `compose_file`, plus `health_service`, `health_url` or both.
@@ -818,9 +951,9 @@ build type:
 | --- | --- | --- |
 | `source` | `git` or `upload`; cannot change after creation | `git` |
 | `name` | Display name, up to 100 characters | required |
-| `repo` | HTTPS or SSH Git URL, without embedded credentials | required |
-| `branch` | Branch to deploy | required |
-| `mode` | `manual`, `poll`, `webhook` or `both` (webhook + polling) | required |
+| `repo` | HTTPS or SSH Git URL, without embedded credentials | required for Git projects |
+| `branch` | Branch to deploy | required for Git projects |
+| `mode` | `manual`, `poll`, `webhook` or `both` (webhook + polling); upload projects are always `manual` | required for Git projects |
 | `dockerfile` | Path relative to the repository root | — |
 | `port` / `container_port` | Host and container ports (Dockerfile mode) | — |
 | `bind_address` | Host address for the published port: a loopback address, `0.0.0.0` or `::` | `127.0.0.1` |
@@ -836,8 +969,12 @@ build type:
 | `pull_images` | Pull newer base and `image:` images on every deployment | `false` |
 | `allow_privilege_escalation` | Skip the injected `no-new-privileges` | `false` |
 
+Environment variables are not part of the project JSON; manage them with
+`repodeploy env` or the [env API](#15-http-api).
+
 Ready-made examples: [`examples/project.json`](examples/project.json), the
-[Dockerfile project](#dockerfile-mode) and the [Compose project](#compose-mode).
+[Dockerfile project](#dockerfile-mode), the [Compose project](#compose-mode) and
+the [upload project](#step-7-deploy-a-folder-without-git).
 
 ## 15. HTTP API
 
@@ -942,9 +1079,9 @@ sudo -u repodeploy repodeploy backup --output /var/backups/repodeploy-$(date +%F
 ```
 
 The backup is consistent while the daemon runs. It includes the database,
-credentials, provider connections, SSH keys, secrets, logs and release
-manifests, but not Git checkouts (rebuilt from Git) or application volumes and
-images (back those up separately). It contains secrets: store it encrypted and
+credentials, provider connections, SSH keys, secrets, environment variables,
+upload archives, logs and release manifests, but not Git checkouts (rebuilt
+from Git) or application volumes and images (back those up separately). It contains secrets: store it encrypted and
 off-host. Restore into an **empty** state directory with the service stopped;
 see [backup and update](docs/installation.md#backup-and-update).
 
@@ -987,6 +1124,15 @@ decision.
 - **Panel.** Loopback by default, password sign-in with per-client throttling (5
   attempts per minute, then growing lockouts), CSRF tokens on every form, a
   strict Content-Security-Policy and `Host` validation against DNS rebinding.
+- **Variables and secrets.** Stored in `0600` files outside every checkout,
+  never on command lines, never in job records or the database, shown in the
+  panel only on an explicit **Show** request, and redacted from deployment
+  logs (whole values from 4 characters, individual lines from 8). A deployed
+  application can of course read the values it receives.
+- **Uploads.** Only for authenticated users. Archives are size-limited, at most
+  two are processed at once, and extraction rejects absolute paths, `..`,
+  symlinks that resolve outside the archive, hard links, devices and
+  decompression bombs before anything is built.
 - **Containers.** `no-new-privileges` and capped logs on every service;
   Dockerfile-mode ports on `127.0.0.1` unless configured otherwise.
 - **systemd.** The unit restricts system calls, address families, namespaces,
@@ -1002,7 +1148,13 @@ decision.
 | `remote daemon access requires HTTPS` | The CLI refuses plain HTTP to non-loopback hosts. Use an SSH tunnel to `127.0.0.1:8081` or an HTTPS URL. |
 | The CLI rejects the token file | Token files must not be readable by others: `chmod 600 FILE`. |
 | Sign-in locked for a while | Too many failed attempts from your address. Wait for the lockout; behind a proxy, add `--trust-proxy` so clients are not all counted as `127.0.0.1`. |
-| Compose file rejected before building | It uses something outside the [supported subset](#compose-mode), such as `${VAR}`, a bind mount or `privileged`. The deployment error explains why. Write literal dollars as `$$`. |
+| Compose file rejected before building | It uses something outside the [supported subset](#compose-mode), such as `${VAR}` outside `environment`/`build.args`, a bind mount or `privileged`. The deployment error explains why. Write literal dollars as `$$`. |
+| `undefined environment variables: …` | The Compose file references variables the project does not define. Add them under **Environment variables** (or `repodeploy env set`), or give them a default with `${NAME:-value}`. |
+| `build args use …, which are not available at build time` | A `build.args` entry references a variable without the build-time flag. Tick **Also available at build time** (or `env set … --build`) if the value may be embedded in the image. |
+| Variable changes do nothing | Saving variables never restarts the app. Click **Deploy changes** (or `repodeploy deploy-changes`). |
+| Upload rejected with `413` | The archive exceeds `--max-upload` (default 200MB). Exclude build outputs and dependencies with `.repodeployignore`, or raise the limit and your proxy's `client_max_body_size`. |
+| Upload rejected with `429` | Two uploads are already being processed. Retry after a few seconds. |
+| Upload rejected with `400` | The archive is not a valid `.zip`/`.tar.gz`, is empty, or contains something unsafe (absolute paths, `..`, links leaving the archive). The message names the entry. |
 | Deployment fails in `checking` | The app did not become healthy within `health_timeout`. Check the health URL (loopback, `2xx`, no redirects) or the Compose healthcheck, and the container output in the log. |
 | The app is unreachable from other machines | Dockerfile-mode ports bind to `127.0.0.1` by default. Put a reverse proxy in front, or set **Publish port on** to `0.0.0.0`. |
 | `setuid`/`sudo` fails inside the container | `no-new-privileges` blocks privilege escalation. Avoid it, or set **Privilege escalation → Allowed**. |
@@ -1040,6 +1192,12 @@ These changes alter behavior. Review them before upgrading:
   start.
 - **Log masking** ignores fragments shorter than 8 characters, and whole values
   shorter than 4.
+- **Environment variables and uploads.** Existing projects keep working
+  unchanged (`source` defaults to `git`, and no database migration is needed).
+  Compose files may now use `${NAME}`/`${NAME:-default}` in `environment` and
+  `build.args`; a reference to an undefined variable fails the deployment.
+  Behind nginx, add the upload `location` from
+  [HTTPS reverse proxy](#https-reverse-proxy) before using uploads.
 
 ## 20. Development
 
@@ -1053,7 +1211,7 @@ go vet ./...
 requested without their prerequisites.
 
 ```sh
-# Real Docker builds, failures, recovery and volumes; disposable SSH Git server
+# Real Docker builds, failures, recovery, volumes, variables and uploads; disposable SSH Git server
 REPODEPLOY_DOCKER_TEST=1 REPODEPLOY_SSH_TEST=1 go test ./internal/deploy -count=1 -timeout=10m
 
 # Real Linux daemon, CLI and web login (use your Docker engine's architecture)
@@ -1065,12 +1223,15 @@ REPODEPLOY_DAEMON_TEST=1 REPODEPLOY_LINUX_BINARY="$PWD/bin/repodeploy-linux-arm6
 Integration tests create randomly named containers, images and volumes, and
 remove only their own fixtures.
 
-**Layout.**
+**Layout.** RepoDeploy is a modular monolith: one binary, with feature modules
+that own their data and depend only on the standard library.
 
 | Path | Contents |
 | --- | --- |
-| `cmd/repodeploy` | Entry point: daemon, CLI and API client |
-| `internal/deploy` | Store (SQLite), Git, Docker/Compose, deployment engine, poller |
+| `cmd/repodeploy` | Entry point: daemon, CLI (including `up`) and API client |
+| `internal/deploy` | Store (SQLite), Git and upload sources, Docker/Compose, deployment engine, poller |
+| `internal/envvars` | Environment variables: storage, `.env` parsing, change digests, Compose substitution |
+| `internal/upload` | Uploads: safe extraction, normalised archives, retention, client-side file selection |
 | `internal/scm` | GitHub, Bitbucket and SSH connections |
 | `internal/web` | Web panel (templates and `static/` assets), HTTP API, authentication |
 | `packaging`, `scripts` | systemd unit and installer |
@@ -1085,7 +1246,10 @@ RepoDeploy does not include any of the following:
 - Full Compose compatibility (only a validated subset is supported).
 - Multiple users or teams.
 - A plugin system or billing.
-- A built-in TLS proxy.
+- A built-in TLS proxy or automatic domains.
+- Managed databases or other add-on services (run them yourself as Compose
+  services with named volumes).
+- Variables shared between projects.
 - Automatic database recovery.
 - Zero-downtime deployments.
 
@@ -1093,7 +1257,8 @@ RepoDeploy does not include any of the following:
 
 - [Installation, update and removal](docs/installation.md)
 - [Configuration and recovery boundaries](docs/operations.md)
-- [Specification](docs/spec.md)
+- [Specification](docs/spec.md) and the
+  [environment variables and upload design](docs/superpowers/specs/2026-11-08-env-vars-and-upload-design.md)
 - [Implementation plan](docs/plan.md) and [progress log](docs/progress.md)
 
 ## License
