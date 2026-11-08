@@ -494,12 +494,13 @@ reproducible and confined to the host's rules:
   `environment`, `ports`, `expose`, `healthcheck`, `depends_on`, `restart`,
   `volumes`, `networks`, `secrets`, `configs`, `working_dir`, `user`, `init`,
   `stop_grace_period`, `read_only`, `tmpfs`, `cap_drop`.
-- **Not allowed:** includes, `extends`, variable interpolation, env files,
+- **Not allowed:** includes, `extends`, env files,
   profiles, remote build contexts, privileged mode, fixed container names, host
   networking, bind mounts, anonymous volumes, extra capabilities and socket
   mounts.
-- Environment values must be explicit. Write a literal dollar sign as `$$`; any
-  other `$` is rejected as interpolation.
+- Environment values must be explicit or reference project variables as
+  `${NAME}` / `${NAME:-default}` (also allowed in `build.args`). Write a literal
+  dollar sign as `$$`; any other `$` is rejected as interpolation.
 - Persistent data must live in **named volumes** (`data:/data`) declared with an
   empty definition (`data: {}`). Volumes survive deployments, rollbacks and
   retention.
@@ -530,6 +531,39 @@ deleted automatically after 24 hours. Manual SSH access needs an unencrypted,
 read-only deploy key and a **verified** `known_hosts` file; the SSH agent,
 password prompts and trust-on-first-use are disabled. Submodules and Git LFS
 are not supported.
+
+### Manual upload (no Git)
+
+A project can deploy code you upload instead of a Git repository: useful for
+prototypes, code that is not on a Git host, or a quick test.
+
+1. On the dashboard choose **Upload a project**, give it a name and the same
+   build and health settings as any project, and save.
+2. Upload a `.zip` or `.tar.gz` of the project folder from the project page, or
+   run this from the folder:
+
+   ```sh
+   repodeploy up --project PROJECT_ID
+   ```
+
+   The first upload saves the ID in `.repodeploy/project`, so later runs need
+   only `repodeploy up`. The CLI follows the deployment log; `--detach` returns
+   immediately and `--force` redeploys an archive identical to the active
+   release.
+
+What is sent: inside a Git work tree, the files `git ls-files` reports (tracked
+files and untracked files not ignored by `.gitignore`); elsewhere every file
+except `.git/`. Patterns in `.repodeployignore` (gitignore subset: `*`, `?`,
+`**`, `dir/`, `/anchored`, `!negation`) are excluded too. `.env` and `.env.*`
+files are never sent; store their values as
+[environment variables](#environment-variables).
+
+Upload projects have no polling, webhooks or CI/CD gate. Each archive is
+validated (no absolute paths, `..`, links leaving the archive, devices or hard
+links), limited to 200 MB by default (`serve --max-upload`) and stored under
+its SHA-256, so history, rollback and **Deploy changes** work as for Git
+projects. If the archive holds a single top-level folder, its contents become
+the project root.
 
 Details: [browser and SSH connections](docs/installation.md#browser-and-ssh-connections).
 
@@ -668,6 +702,37 @@ printf '%s' 'correct-horse-battery-staple' | repodeploy secret PROJECT_ID db_pas
   encrypted against the host administrator.
 - Maximum size: about 1 MB per value.
 
+### Environment variables
+
+Values such as `DATABASE_URL` are stored per project on this host
+(`STATE/secrets/<project>.env.json`, mode 0600) and never belong in Git.
+
+- **Dockerfile mode:** every variable reaches the container environment.
+- **Compose mode:** reference them as `${NAME}` or `${NAME:-default}` in a
+  service's `environment:` values or `build.args:`. Interpolation anywhere else
+  is still rejected, so variables cannot change images, ports or volumes. An
+  undefined variable without a default fails the deployment before the build.
+- **Build time:** a variable reaches the image build only when it is marked
+  *available at build* (`--build`). Build arguments are stored in the image
+  history, so mark only values that are safe to embed, such as
+  `NEXT_PUBLIC_*`.
+
+Saving variables restarts nothing. When the active release was built with
+other values, the project page shows **Deploy changes**, which rebuilds the
+active commit or upload with the current values. Each release keeps the values
+it was built with, so restoring an old release restores its variables too.
+Values are redacted from deployment logs.
+
+```sh
+repodeploy env set PROJECT_ID DATABASE_URL < db-url.txt
+printf '%s' "$TOKEN" | repodeploy env set PROJECT_ID API_TOKEN
+printf '%s' 'https://api.example.org' | repodeploy env set PROJECT_ID NEXT_PUBLIC_API_URL --build
+repodeploy env import PROJECT_ID .env
+repodeploy env list PROJECT_ID          # names only; --reveal shows values
+repodeploy env unset PROJECT_ID API_TOKEN
+repodeploy deploy-changes PROJECT_ID
+```
+
 ## 13. CLI reference
 
 ```
@@ -681,7 +746,7 @@ they combine well with `jq`.
 | Command | Description |
 | --- | --- |
 | `init --password-file FILE\|-` | Initialize administrator credentials |
-| `serve [--listen ADDR] [--public-url URL] [--trust-proxy] [--allowed-hosts H,...]` | Run the daemon (the systemd unit does this) |
+| `serve [--listen ADDR] [--public-url URL] [--trust-proxy] [--allowed-hosts H,...] [--max-upload SIZE]` | Run the daemon (the systemd unit does this) |
 | `passwd --password-file FILE\|-` | Change the password; signs out all browsers |
 | `rotate-token` | Issue a new CLI token and revoke the old one |
 | `projects` | List projects |
@@ -689,6 +754,12 @@ they combine well with `jq`.
 | `add --file FILE` | Create a project from JSON |
 | `update ID --file FILE` | Replace a project's settings from JSON |
 | `deploy ID` | Queue a deployment of the configured branch |
+| `deploy-changes ID` | Redeploy the active release with the current variables |
+| `env list ID [--reveal]` | List variables; values only with `--reveal` |
+| `env set ID NAME [--build\|--no-build]` | Store a variable read from standard input |
+| `env unset ID NAME` | Delete a variable |
+| `env import ID FILE\|-` | Store every variable of a `.env` file |
+| `up [--project ID] [--force] [--detach] [DIR]` | Upload a folder to an upload project and deploy it |
 | `history ID` | Show deployment history |
 | `logs JOB_ID [--follow]` | Read or stream a deployment log |
 | `rollback ID RELEASE_ID` | Restore a retained release; pauses automation |
@@ -706,6 +777,7 @@ they combine well with `jq`.
 | `--public-url` | External HTTPS URL behind a reverse proxy; enables HSTS and secure cookies |
 | `--trust-proxy` | Identify clients by `X-Forwarded-For` from a loopback proxy |
 | `--allowed-hosts` | Extra `Host` names the panel accepts |
+| `--max-upload` | Largest accepted upload archive, e.g. `200MB` (default) or `1GB` |
 
 ### Everyday recipes
 
@@ -734,7 +806,7 @@ blocked) is not affected.
 
 ## 14. Project configuration reference
 
-Every project needs `name`, `repo`, `branch` and `mode`, plus the fields of one
+Git projects need `name`, `repo`, `branch` and `mode`; upload projects need `name` and `"source": "upload"`. Both need the fields of one
 build type:
 
 - **Dockerfile:** `dockerfile`, `port`, `container_port` and `health_url`.
@@ -742,6 +814,7 @@ build type:
 
 | Field | Values | Default |
 | --- | --- | --- |
+| `source` | `git` or `upload`; cannot change after creation | `git` |
 | `name` | Display name, up to 100 characters | required |
 | `repo` | HTTPS or SSH Git URL, without embedded credentials | required |
 | `branch` | Branch to deploy | required |
@@ -788,6 +861,11 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/projects
 | `GET /api/projects/{id}/secrets` | Secret names and metadata (never values) |
 | `PUT /api/projects/{id}/secrets/{name}` | Store a secret (raw body) |
 | `DELETE /api/projects/{id}/secrets/{name}` | Delete a secret |
+| `GET /api/projects/{id}/env[?reveal=1]` | Variable names, build flags and pending state; values only with `reveal=1` |
+| `PUT /api/projects/{id}/env` | Upsert variables: `[{"name": "…", "value": "…", "build": true}]` |
+| `DELETE /api/projects/{id}/env/{name}` | Delete a variable |
+| `POST /api/projects/{id}/deploy-changes` | Redeploy the active release with current variables (`202`; `409` when nothing is deployed) |
+| `POST /api/projects/{id}/uploads[?force=1]` | Upload an archive (raw body, `application/octet-stream`): `202` queued, `200` already active, `413` too large |
 | `POST /api/projects/{id}/webhook-secret` | Rotate the webhook secret |
 | `GET /api/jobs/{id}` | Get a deployment |
 | `GET /api/jobs/{id}/logs[?follow=1]` | Log as text, or as a Server-Sent Events stream |

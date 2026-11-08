@@ -209,3 +209,20 @@ Four blocks applied in order, each test-first against the existing suite.
   integrations: 157 tests/subtests passed, no failures or skips. Vet, module
   verification, gofmt and installer syntax pass; Linux binaries rebuilt.
   No commits, pushes or publication performed.
+
+## Environment variables and manual upload — 2026-11-08
+
+- Modular monolith: new `internal/envvars` and `internal/upload` modules
+  (stdlib only); engine selects sources through `SourcePreparer`.
+- Variables: storage, `.env` import, restricted Compose substitution,
+  build-time opt-in, digest per release, deploy changes, rollback restores
+  values, log redaction; API, panel and CLI.
+- Uploads: validated and normalised archives, retention with a one-hour grace,
+  backups, panel form, `POST /api/projects/{id}/uploads`, `repodeploy up`.
+- Verification: gofmt and `go vet` clean; `go mod verify` all modules verified;
+  `go test ./... -count=1` and `go test -race ./... -count=1` ok for every
+  package; linux/amd64 and linux/arm64 builds and `sh -n scripts/install.sh`
+  pass. The Docker integration `TestDockerIntegrationEnvironmentAndUpload` ran
+  (not skipped) and passed for the dockerfile and compose subtests (about 50 s),
+  and the full `internal/deploy` suite with `REPODEPLOY_DOCKER_TEST=1` passed
+  (about 123 s).

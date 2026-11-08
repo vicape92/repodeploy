@@ -3,13 +3,15 @@
 ## Compose subset
 
 One YAML document. Top-level fields: `services`, `volumes`, `networks`, `secrets`,
-`configs`. No includes, extends, variable interpolation, env files, profiles, remote build
+`configs`. No includes, extends, env files, profiles, remote build
 contexts, privileged mode, fixed container names, host networking, arbitrary bind
 mounts, anonymous volumes, additional capabilities or socket mounts.
 Image-declared `VOLUME` destinations also require explicit named mounts; otherwise
 the deployment is rejected before activation. A literal dollar sign is written
 `$$`, as Compose requires (for example `test: ["CMD-SHELL", "test -n \"$$HOME\""]`);
-any other `$` is rejected as interpolation.
+project variables are interpolated only as `${NAME}` or `${NAME:-default}` inside
+`environment` values and `build.args` (inserted values keep `$` literal); any
+other `$` is rejected as interpolation.
 
 Services that use `image:` reuse a tag already present on the host, so moving
 tags such as `:latest` stay frozen. Select **Image updates → Pull newer images on
@@ -140,7 +142,12 @@ remain the Git provider's responsibility.
 ## State, retention and permissions
 
 The state directory contains `state.db`, SQLite WAL files, `engine.lock`, protected
-administrator credentials, `secrets/`, `releases/JOB_ID/` and `logs/JOB_ID.log`.
+administrator credentials, `secrets/` (including `<project>.env.json` variable
+files), `releases/JOB_ID/`, `logs/JOB_ID.log` and `uploads/<project>/<sha256>.tar.gz`
+(normalised upload archives; `uploads/tmp/` holds in-flight files, swept after
+24 hours). An upload archive is kept while any retained release references it.
+`serve --max-upload` (default 200MB) caps archives; extraction is capped at five
+times that size and 50 000 entries. Backups include `uploads/` except `tmp/`.
 Never put this directory inside a Git checkout. Do not share it between hosts or
 put SQLite on a network filesystem.
 

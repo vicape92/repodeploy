@@ -172,3 +172,20 @@ required to inspect private CI even when Git transport uses SSH; the UI explains
 and validates that requirement rather than silently bypassing CI. A waiting job
 holds later deployments of the same project in FIFO order while other projects
 continue. Superseded automatic targets are failed and the current head reconciled.
+
+## Environment variables and manual upload
+
+Approved 2026-11-08; full design in
+`docs/superpowers/specs/2026-11-08-env-vars-and-upload-design.md`.
+
+- Modular monolith: `internal/envvars` and `internal/upload` own their data and
+  import only the standard library; `deploy` uses them through `Store.Env`,
+  `Store.Uploads` and the `SourcePreparer` interface.
+- Per-project variables live outside Git, reach Dockerfile services directly
+  and Compose services through `${NAME}`/`${NAME:-default}` in `environment`
+  and `build.args` only. Build-time exposure is opt-in per variable. Each
+  release records a digest; "deploy changes" rebuilds the active source;
+  rollback restores the release's values.
+- Upload projects (`source: upload`) deploy validated, normalised,
+  SHA-256-addressed archives from the panel or `repodeploy up`; they have no
+  polling, webhooks or CI. No schema change.
