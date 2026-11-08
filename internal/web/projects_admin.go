@@ -55,7 +55,7 @@ func (s *Server) projectView(p deploy.Project) (page, error) {
 	for _, v := range vars {
 		rows = append(rows, envRow{Name: v.Name, Build: v.Build})
 	}
-	return page{View: "project", Project: p, Jobs: jobs, Secrets: secrets, EnvRows: rows, EnvPending: pending}, nil
+	return page{View: "project", Project: p, Jobs: jobs, Secrets: secrets, EnvRows: rows, EnvPending: pending, MaxUpload: humanBytes(s.maxUpload())}, nil
 }
 
 func (s *Server) deletePage(w http.ResponseWriter, r *http.Request) {

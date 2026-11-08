@@ -81,3 +81,16 @@ func TestCLIManagesEnvironmentVariables(t *testing.T) {
 		t.Fatalf("deploy-changes without release: %v", err)
 	}
 }
+
+func TestParseSize(t *testing.T) {
+	for in, want := range map[string]int64{"200MB": 200 << 20, "1gb": 1 << 30, "2048KB": 2 << 20, "1048576": 1 << 20} {
+		if got, err := parseSize(in); err != nil || got != want {
+			t.Errorf("%s: %d %v", in, got, err)
+		}
+	}
+	for _, bad := range []string{"", "abc", "-1MB", "512KB", "10TB"} {
+		if _, err := parseSize(bad); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}

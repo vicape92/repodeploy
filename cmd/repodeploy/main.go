@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,7 +35,7 @@ Usage: repodeploy [--state DIR] [--url URL] [--token-file FILE] COMMAND
   passwd --password-file FILE|-     Change the password; signs out browsers
   rotate-token                     Issue a new CLI token; revokes the old one
   serve [--listen ADDR] [--public-url HTTPS_URL] [--trust-proxy]
-        [--allowed-hosts HOST,...]
+        [--allowed-hosts HOST,...] [--max-upload SIZE]
   projects                         List projects
   project ID                       Show project settings
   add --file FILE                   Create a project from JSON
@@ -465,7 +466,12 @@ func serve(ctx context.Context, root string, args []string, out io.Writer) error
 	public := fs.String("public-url", "", "external HTTPS URL behind a reverse proxy")
 	trustProxy := fs.Bool("trust-proxy", false, "identify clients by X-Forwarded-For from a loopback reverse proxy")
 	allowedHosts := fs.String("allowed-hosts", "", "comma-separated extra Host names accepted by the panel")
+	maxUpload := fs.String("max-upload", "200MB", "largest accepted upload archive, e.g. 200MB or 1GB")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	uploadLimit, err := parseSize(*maxUpload)
+	if err != nil {
 		return err
 	}
 	var extraHosts []string
@@ -521,6 +527,7 @@ func serve(ctx context.Context, root string, args []string, out io.Writer) error
 	handler.BaseURL = *public
 	handler.TrustProxy = *trustProxy
 	handler.AllowedHosts = extraHosts
+	handler.MaxUpload = uploadLimit
 	child, cancel := context.WithCancel(ctx)
 	defer cancel()
 	server := &http.Server{Addr: *listen, Handler: handler.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 << 10, BaseContext: func(net.Listener) context.Context { return child }}
@@ -556,4 +563,27 @@ func serve(ctx context.Context, root string, args []string, out io.Writer) error
 		return nil
 	}
 	return err
+}
+
+// parseSize reads sizes such as 200MB, 1GB, 2048KB or a plain byte count.
+func parseSize(s string) (int64, error) {
+	text := strings.ToUpper(strings.TrimSpace(s))
+	factor := int64(1)
+	for _, unit := range []struct {
+		suffix string
+		factor int64
+	}{{"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"B", 1}} {
+		if strings.HasSuffix(text, unit.suffix) {
+			text, factor = strings.TrimSpace(strings.TrimSuffix(text, unit.suffix)), unit.factor
+			break
+		}
+	}
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || n <= 0 || n > (1<<40)/factor {
+		return 0, fmt.Errorf("invalid size %q; use a value such as 200MB or 1GB", s)
+	}
+	if n*factor < 1<<20 {
+		return 0, errors.New("--max-upload must be at least 1MB")
+	}
+	return n * factor, nil
 }

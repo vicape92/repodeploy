@@ -45,6 +45,11 @@ type Server struct {
 	AllowedHosts []string
 	// Deleter removes projects; serve wires it to the deployment engine.
 	Deleter ProjectDeleter
+	// MaxUpload is the largest accepted upload archive; zero selects
+	// upload.DefaultMaxBytes.
+	MaxUpload int64
+	// uploadSlots bounds concurrent upload processing.
+	uploadSlots chan struct{}
 }
 
 func New(s *deploy.Store, secure bool) (*Server, error) {
@@ -56,7 +61,7 @@ func New(s *deploy.Store, secure bool) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{Store: s, auth: c, credInfo: info, secure: secure, sessions: make(map[string]session), limiter: newLoginLimiter(), webhookSlots: make(chan struct{}, 4), loginSlots: make(chan struct{}, 2), flows: make(map[string]connectionFlow)}, nil
+	return &Server{Store: s, auth: c, credInfo: info, secure: secure, sessions: make(map[string]session), limiter: newLoginLimiter(), webhookSlots: make(chan struct{}, 4), loginSlots: make(chan struct{}, 2), uploadSlots: make(chan struct{}, 2), flows: make(map[string]connectionFlow)}, nil
 }
 
 // credentials returns the administrator credentials, reloading admin.json when
@@ -111,6 +116,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/projects/{id}/env", s.envSet)
 	mux.HandleFunc("DELETE /api/projects/{id}/env/{name}", s.envDelete)
 	mux.HandleFunc("POST /api/projects/{id}/deploy-changes", s.deployChanges)
+	mux.HandleFunc("POST /api/projects/{id}/uploads", s.upload)
 	mux.HandleFunc("DELETE /api/projects/{id}", s.deleteProject)
 	mux.HandleFunc("POST /api/projects/{id}/webhook-secret", s.webhookSecret)
 	mux.HandleFunc("GET /api/jobs/{id}", s.job)
@@ -134,6 +140,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /projects/{id}/env/{name}/reveal", s.envReveal)
 	mux.HandleFunc("POST /projects/{id}/env/{name}/delete", s.envDelete)
 	mux.HandleFunc("POST /projects/{id}/deploy-changes", s.deployChanges)
+	mux.HandleFunc("POST /projects/{id}/uploads", s.upload)
 	mux.Handle("GET /static/", staticHandler())
 	mux.HandleFunc("POST /logout", s.logout)
 	mux.HandleFunc("GET /settings", s.settings)
@@ -165,6 +172,9 @@ func (s *Server) Handler() http.Handler {
 		limit := int64(maxRequestBody)
 		if strings.HasPrefix(r.URL.Path, "/hooks/github/") {
 			limit = maxWebhookBody
+		} else if r.Method == http.MethodPost && isUploadPath(r.URL.Path) {
+			// Room for the archive plus multipart framing.
+			limit = s.maxUpload() + maxRequestBody
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		if r.URL.Path == "/login" || strings.HasPrefix(r.URL.Path, "/hooks/github/") || (r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/static/")) || (r.Method == "GET" && (r.URL.Path == "/connections/github/callback" || r.URL.Path == "/connections/bitbucket/callback")) {
@@ -197,6 +207,13 @@ func (s *Server) Handler() http.Handler {
 		if !tokenOK && r.Method != "GET" && r.Method != "HEAD" {
 			csrf := r.Header.Get("X-CSRF-Token")
 			if csrf == "" {
+				if err := r.ParseMultipartForm(32 << 20); err != nil {
+					var tooLarge *http.MaxBytesError
+					if errors.As(err, &tooLarge) {
+						http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+						return
+					}
+				}
 				csrf = r.FormValue("_csrf")
 			}
 			if !equal(csrf, sess.CSRF) {
@@ -759,6 +776,8 @@ type page struct {
 	EnvPending     bool
 	EnvError       string
 	EnvName        string
+	MaxUpload      string
+	UploadError    string
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, p page) {
@@ -807,6 +826,9 @@ func (s *Server) projectPage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
+	}
+	if r.URL.Query().Get("unchanged") == "1" {
+		view.Notice = "This archive matches the active release, so nothing was deployed. Tick \"Redeploy even if identical\" to deploy it again."
 	}
 	s.render(w, r, view)
 }
