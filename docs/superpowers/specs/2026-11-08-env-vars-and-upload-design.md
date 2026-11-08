@@ -25,6 +25,31 @@ Automatic domains/HTTPS, managed databases, variables shared across projects,
 per-service variable assignment in the panel, uploads into Git projects,
 schema migrations.
 
+## Architecture — modular monolith
+
+RepoDeploy stays one binary and one daemon, organised as modules with explicit
+boundaries. Each new capability is its own package that owns its data and
+exposes a small API; no other package reads or writes that data directly.
+
+| Module | Owns | Depends on |
+|---|---|---|
+| `internal/envvars` | `secrets/<id>.env.json`; validation, `.env` parsing, digest, `${VAR}` substitution | stdlib only |
+| `internal/upload` | `uploads/`; safe extraction, normalisation, hashing, retention, client-side file selection and packing | stdlib only |
+| `internal/deploy` | queue, engine, Docker runtime, Git source (unchanged structure) | `envvars`, `upload`, `scm` |
+| `internal/web` | HTTP API and panel; new handlers in `env.go` and `uploads.go` | `deploy`, `envvars`, `upload`, `scm` |
+| `cmd/repodeploy` | CLI and daemon wiring; `up` in `up.go` | all of the above |
+
+- `deploy.Store` exposes the module stores as fields (`Env *envvars.Store`,
+  `Uploads *upload.Store`), following the existing `Sources *scm.Manager`
+  pattern.
+- The engine prepares source code through a `SourcePreparer` interface
+  (`Prepare(ctx, project, ref, dest)`), implemented by the Git source and by an
+  adapter over `upload.Store`. Project deletion asks each module to delete its
+  own data (`envvars.DeleteProject`, `upload.DeleteProject`).
+- No import cycles: `envvars` and `upload` never import `deploy` or `web`.
+- Restructuring the rest of `internal/deploy` into modules is a separate,
+  later project and out of scope here.
+
 ## Part 1 — Environment variables
 
 ### Storage
@@ -74,19 +99,21 @@ schema migrations.
   and the current digest differs from the active release's digest. A release
   without `env_digest` (created before this feature) counts as the digest of
   an empty variable set.
-- **Deploy changes** enqueues a manual job (`source="config"`) that rebuilds the
-  active release's source — the same Git commit, or the same upload hash — with
-  the current variables. It goes through build, activation, health check and
-  recovery like any other deployment. For Git projects it skips the
-  superseded-target check and CI wait, as manual deployments do today. Disabled
-  (with explanation) when there is no active release.
+- **Deploy changes** enqueues a manual job pinned to the active release's
+  source — the same Git commit, or the same upload hash — so it rebuilds with
+  the current variables. It behaves exactly like a manual deployment of that
+  commit: build, activation, health check and recovery; if the project waits
+  for CI, the commit's results are already published, so the wait ends at the
+  first check. Unavailable (API 409, no button) when there is no active
+  release; the first deployment already uses the stored variables.
 - Saving variables never triggers a deployment by itself.
 
 ### Interfaces
 
-- **Panel (project page):** variables table with masked values, a per-row reveal
-  button (POST with CSRF; value returned only in that response), inline edit,
-  delete, a build-time checkbox with a warning tooltip, and a **Paste .env** mode
+- **Panel (project page):** variables table with masked values, a per-row
+  **Show** button (POST with CSRF; the value is shown only on that response
+  page), delete, an add/replace form (saving an existing name replaces its
+  value and flag) with a build-time checkbox and warning, and a **Paste .env** mode
   that parses `KEY=value` lines (supports `#` comments, `export ` prefix, single-
   and double-quoted values with `\n` escapes in double quotes) and upserts them.
   The "Undeployed changes" banner and **Deploy changes** button appear when
@@ -122,8 +149,9 @@ schema migrations.
 
 ### Receiving an upload
 
-Endpoints: `POST /api/projects/ID/uploads` (bearer; raw body or multipart field
-`file`) and the panel's multipart form (session + CSRF). Steps:
+Endpoints: `POST /api/projects/ID/uploads` (bearer; raw archive body,
+`Content-Type: application/octet-stream`) and `POST /projects/ID/uploads`, the
+panel's multipart form (field `file`, session + CSRF). Steps:
 
 1. Stream the body into a temp file under `<state>/uploads/tmp/` (0600). Limit:
    200 MB by default, configurable with the daemon flag `--max-upload`
@@ -168,10 +196,13 @@ Validation errors never leave files behind.
 
 ### Retention
 
-An archive is deleted during `prune` when no retained release and no queued or
-running job references its hash. Active and recovery releases stay protected
-as today. Project deletion removes `uploads/<project-id>/`. Temp files older
-than 24 hours in `uploads/tmp/` are swept at daemon start.
+An archive is deleted during `prune` when no retained job row (history,
+queued or running) references its hash. Active and recovery releases stay
+protected as today, so their archives do too. Archives modified in the last
+hour are never pruned, which closes the window between storing an upload and
+enqueuing its job. Project deletion removes `uploads/<project-id>/`. Temp files
+older than 24 hours in `uploads/tmp/` are swept at daemon start. `repodeploy
+backup` includes `uploads/` except `uploads/tmp/`.
 
 ### CLI `repodeploy up [--project ID] [DIR]`
 
@@ -212,7 +243,7 @@ than 24 hours in `uploads/tmp/` are swept at daemon start.
 | Unsupported archive format | 400 "upload a .zip or .tar.gz" |
 | Upload identical to active release | 200 with existing job; `--force` to redeploy |
 | Retained archive missing | Job fails: "upload archive unavailable; upload it again" |
-| Deploy changes without active release | Button disabled with explanation; API returns 409 |
+| Deploy changes without active release | No button; API returns 409 "nothing is deployed yet" |
 | Git fields on an upload project (or vice versa) | Field-level validation error |
 
 ## Testing
