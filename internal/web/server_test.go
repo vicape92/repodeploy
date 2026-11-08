@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"repodeploy/internal/deploy"
+	"github.com/vicape92/repodeploy/internal/deploy"
 )
 
 func webFixture(t *testing.T) (*Server, *httptest.Server, string) {

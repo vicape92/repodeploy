@@ -13,7 +13,7 @@ import (
 	"sort"
 	"strings"
 
-	"repodeploy/internal/scm"
+	"github.com/vicape92/repodeploy/internal/scm"
 )
 
 type Git struct{ Sources *scm.Manager }

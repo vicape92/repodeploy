@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"repodeploy/internal/deploy"
-	"repodeploy/internal/web"
+	"github.com/vicape92/repodeploy/internal/deploy"
+	"github.com/vicape92/repodeploy/internal/web"
 )
 
 func TestCLIUsesRepoDeployName(t *testing.T) {

@@ -1,4 +1,4 @@
-module repodeploy
+module github.com/vicape92/repodeploy
 
 go 1.26.0
 

@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"repodeploy/internal/scm"
+	"github.com/vicape92/repodeploy/internal/scm"
 
 	_ "modernc.org/sqlite"
 )

@@ -21,8 +21,8 @@ import (
 	"syscall"
 	"time"
 
-	"repodeploy/internal/deploy"
-	"repodeploy/internal/web"
+	"github.com/vicape92/repodeploy/internal/deploy"
+	"github.com/vicape92/repodeploy/internal/web"
 )
 
 const help = `RepoDeploy — self-hosted Git deployments

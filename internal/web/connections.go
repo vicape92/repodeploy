@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"repodeploy/internal/deploy"
-	"repodeploy/internal/scm"
+	"github.com/vicape92/repodeploy/internal/deploy"
+	"github.com/vicape92/repodeploy/internal/scm"
 )
 
 type connectionFlow struct {

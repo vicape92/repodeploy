@@ -22,8 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vicape92/repodeploy/internal/deploy"
 	"golang.org/x/crypto/ssh"
-	"repodeploy/internal/deploy"
 )
 
 type providerTransport struct{ base *url.URL }

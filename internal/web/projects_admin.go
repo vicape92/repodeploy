@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"repodeploy/internal/deploy"
+	"github.com/vicape92/repodeploy/internal/deploy"
 )
 
 // ProjectDeleter removes a project and the resources it created.

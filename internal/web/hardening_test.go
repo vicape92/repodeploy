@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"repodeploy/internal/deploy"
+	"github.com/vicape92/repodeploy/internal/deploy"
 )
 
 func TestSecureServerUsesPrefixedCookiesAndHSTS(t *testing.T) {

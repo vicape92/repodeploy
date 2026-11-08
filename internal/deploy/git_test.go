@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"repodeploy/internal/scm"
+	"github.com/vicape92/repodeploy/internal/scm"
 )
 
 func gitTest(t *testing.T, dir string, args ...string) string {
