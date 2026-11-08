@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/vicape92/repodeploy/internal/deploy"
+	"github.com/vicape92/repodeploy/internal/envvars"
 	"github.com/vicape92/repodeploy/internal/web"
 )
 
@@ -39,6 +40,12 @@ Usage: repodeploy [--state DIR] [--url URL] [--token-file FILE] COMMAND
   add --file FILE                   Create a project from JSON
   update ID --file FILE             Update project settings from JSON
   deploy ID                        Queue deployment of the configured branch
+  deploy-changes ID                Redeploy the active release with current variables
+  env list ID [--reveal]           List environment variables (values with --reveal)
+  env set ID NAME [--build|--no-build]
+                                   Store a variable; the value is read from stdin
+  env unset ID NAME                Delete a variable
+  env import ID FILE|-             Store every variable of a .env file
   rollback ID RELEASE_ID           Restore a retained release; pause automation
   resume ID                        Resume automation after rollback
   history ID                       Show deployment history
@@ -198,7 +205,7 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 		if err != nil {
 			return err
 		}
-	case "deploy", "resume", "webhook-secret":
+	case "deploy", "resume", "webhook-secret", "deploy-changes":
 		if err = need(2); err != nil {
 			return err
 		}
@@ -248,6 +255,61 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 			path += "?volumes=1"
 		}
 		method = http.MethodDelete
+	case "env":
+		if err = need(3); err != nil {
+			return err
+		}
+		path = "/api/projects/" + url.PathEscape(args[2]) + "/env"
+		switch args[1] {
+		case "list":
+			for _, option := range args[3:] {
+				if option != "--reveal" {
+					return fmt.Errorf("unknown env list option %q", option)
+				}
+				path += "?reveal=1"
+			}
+		case "set":
+			if err = need(4); err != nil {
+				return err
+			}
+			update := envvars.Update{Name: args[3]}
+			for _, option := range args[4:] {
+				build := option == "--build"
+				if !build && option != "--no-build" {
+					return fmt.Errorf("unknown env set option %q", option)
+				}
+				update.Build = &build
+			}
+			value, err := io.ReadAll(io.LimitReader(in, envvars.MaxValueLen+2))
+			if err != nil {
+				return err
+			}
+			update.Value = strings.TrimSuffix(strings.TrimSuffix(string(value), "\n"), "\r")
+			body, _ = json.Marshal([]envvars.Update{update})
+			method = http.MethodPut
+		case "unset":
+			if err = need(4); err != nil {
+				return err
+			}
+			path += "/" + url.PathEscape(args[3])
+			method = http.MethodDelete
+		case "import":
+			if err = need(4); err != nil {
+				return err
+			}
+			text, err := readFile(args[3], in)
+			if err != nil {
+				return err
+			}
+			updates, err := envvars.ParseDotEnv(string(text))
+			if err != nil {
+				return err
+			}
+			body, _ = json.Marshal(updates)
+			method = http.MethodPut
+		default:
+			return fmt.Errorf("unknown env command %q; use list, set, unset or import", args[1])
+		}
 	case "secret":
 		if err = need(3); err != nil {
 			return err
