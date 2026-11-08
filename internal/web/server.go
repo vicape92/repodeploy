@@ -116,6 +116,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/jobs/{id}", s.job)
 	mux.HandleFunc("GET /api/jobs/{id}/logs", s.logs)
 	mux.HandleFunc("GET /{$}", s.dashboard)
+	mux.HandleFunc("GET /projects/new", s.newProjectPage)
 	mux.HandleFunc("GET /projects/{id}", s.projectPage)
 	mux.HandleFunc("GET /jobs/{id}", s.jobPage)
 	mux.HandleFunc("POST /projects", s.saveProject)
@@ -388,6 +389,11 @@ func projectFromForm(r *http.Request) deploy.Project {
 	p.CITimeout = integer("ci_timeout")
 	p.AllowPrivilegeEscalation = r.FormValue("privilege_escalation") == "allow"
 	p.PullImages = r.FormValue("pull_images") == "on"
+	p.Source = r.FormValue("source")
+	if p.IsUpload() {
+		p.Repo, p.Branch, p.Mode, p.SSHKey, p.KnownHosts = "", "", "", "", ""
+		p.Connection, p.RepositoryID, p.WaitCI, p.PollSeconds, p.CITimeout = "", "", false, 0, 0
+	}
 	switch r.FormValue("build_type") {
 	case "compose":
 		p.Dockerfile, p.Port, p.ContainerPort, p.BindAddress = "", 0, 0, ""
@@ -443,8 +449,13 @@ func (s *Server) saveProject(w http.ResponseWriter, r *http.Request) {
 	}
 	p.ID = r.PathValue("id")
 	if p.ID != "" {
-		if _, err := s.Store.Project(p.ID); err != nil {
+		existing, err := s.Store.Project(p.ID)
+		if err != nil {
 			http.NotFound(w, r)
+			return
+		}
+		if existing.IsUpload() != p.IsUpload() {
+			fail(400, &deploy.FieldError{Field: "source", Message: "a project's source cannot change; create a new project instead"})
 			return
 		}
 	}
@@ -495,7 +506,16 @@ func (s *Server) saveProject(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
-	j, err := s.Store.Enqueue(r.PathValue("id"), "manual", "", "", "")
+	p, err := s.Store.Project(r.PathValue("id"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if p.IsUpload() {
+		http.Error(w, "upload projects deploy when you upload a new version; use deploy-changes to apply new variables", 409)
+		return
+	}
+	j, err := s.Store.Enqueue(p.ID, "manual", "", "", "")
 	respondJob(w, r, j, err)
 }
 func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
@@ -644,6 +664,10 @@ func (s *Server) webhookSecret(w http.ResponseWriter, r *http.Request) {
 	p, err := s.Store.Project(r.PathValue("id"))
 	if err != nil {
 		http.NotFound(w, r)
+		return
+	}
+	if p.IsUpload() {
+		http.Error(w, "upload projects have no webhook", 409)
 		return
 	}
 	secret := randomToken()

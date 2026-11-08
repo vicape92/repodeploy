@@ -31,6 +31,17 @@ func ErrorField(err error) string {
 }
 
 func ValidateProject(p Project) error {
+	if p.Source != "" && p.Source != "git" && p.Source != "upload" {
+		return fieldErr("source", "source must be git or upload")
+	}
+	if p.IsUpload() {
+		if p.Repo != "" || p.Branch != "" || p.Connection != "" || p.RepositoryID != "" || p.SSHKey != "" || p.KnownHosts != "" || p.WaitCI || p.CIProvider != "" {
+			return fieldErr("source", "upload projects have no Git repository, branch, SSH key or CI/CD settings")
+		}
+		if p.Mode != "" && p.Mode != "manual" {
+			return fieldErr("mode", "upload projects deploy when you upload; detection must be manual")
+		}
+	}
 	if p.Connection != "" && p.Connection != "github" && p.Connection != "bitbucket" {
 		return fieldErr("connection", "unsupported repository connection")
 	}
@@ -46,25 +57,10 @@ func ValidateProject(p Project) error {
 	if strings.TrimSpace(p.Name) == "" || len(p.Name) > 100 {
 		return fieldErr("name", "a project name of at most 100 characters is required")
 	}
-	if strings.TrimSpace(p.Repo) == "" || len(p.Repo) > 2048 {
-		return fieldErr("repo", "a Git URL of at most 2048 characters is required")
-	}
-	if err := gitInputs(p); err != nil {
-		return err
-	}
-	u, err := url.Parse(p.Repo)
-	scp := strings.HasPrefix(p.Repo, "git@") && strings.Contains(p.Repo, ":")
-	if !scp && (err != nil || (u.Scheme != "https" && u.Scheme != "ssh") || u.Hostname() == "" || u.RawQuery != "" || u.Fragment != "" || (u.User != nil && u.Scheme != "ssh")) {
-		return fieldErr("repo", "use an HTTPS or SSH Git URL without embedded credentials")
-	}
-	if err := exec.Command("git", "check-ref-format", "--branch", p.Branch).Run(); err != nil {
-		return fieldErr("branch", "invalid deployment branch")
-	}
-	if p.Mode != "manual" && p.Mode != "poll" && p.Mode != "webhook" && p.Mode != "both" {
-		return fieldErr("mode", "mode must be manual, poll, webhook or both")
-	}
-	if (p.Mode == "webhook" || p.Mode == "both") && githubRepo(p.Repo) == "" {
-		return fieldErr("mode", "webhook mode currently supports github.com repositories only")
+	if !p.IsUpload() {
+		if err := validateGitSource(p); err != nil {
+			return err
+		}
 	}
 	if (p.Dockerfile == "") == (p.ComposeFile == "") {
 		return fieldErr("build_type", "configure exactly one Dockerfile or Compose file")
@@ -124,6 +120,32 @@ func ValidateProject(p Project) error {
 		if stat.Mode().Perm()&0077 != 0 {
 			return fieldErr("ssh_key", "SSH private key must not be accessible to group or others")
 		}
+	}
+	return nil
+}
+
+// validateGitSource checks the repository, branch and detection settings of
+// Git projects.
+func validateGitSource(p Project) error {
+	if strings.TrimSpace(p.Repo) == "" || len(p.Repo) > 2048 {
+		return fieldErr("repo", "a Git URL of at most 2048 characters is required")
+	}
+	if err := gitInputs(p); err != nil {
+		return err
+	}
+	u, err := url.Parse(p.Repo)
+	scp := strings.HasPrefix(p.Repo, "git@") && strings.Contains(p.Repo, ":")
+	if !scp && (err != nil || (u.Scheme != "https" && u.Scheme != "ssh") || u.Hostname() == "" || u.RawQuery != "" || u.Fragment != "" || (u.User != nil && u.Scheme != "ssh")) {
+		return fieldErr("repo", "use an HTTPS or SSH Git URL without embedded credentials")
+	}
+	if err := exec.Command("git", "check-ref-format", "--branch", p.Branch).Run(); err != nil {
+		return fieldErr("branch", "invalid deployment branch")
+	}
+	if p.Mode != "manual" && p.Mode != "poll" && p.Mode != "webhook" && p.Mode != "both" {
+		return fieldErr("mode", "mode must be manual, poll, webhook or both")
+	}
+	if (p.Mode == "webhook" || p.Mode == "both") && githubRepo(p.Repo) == "" {
+		return fieldErr("mode", "webhook mode currently supports github.com repositories only")
 	}
 	return nil
 }

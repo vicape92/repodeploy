@@ -23,8 +23,11 @@ var ErrNoJob = errors.New("no job available")
 var ErrPaused = errors.New("project automation is paused or blocked")
 
 type Project struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Source is "git" (or empty) for repository projects and "upload" for
+	// projects that deploy uploaded archives.
+	Source        string `json:"source,omitempty"`
 	Repo          string `json:"repo"`
 	Branch        string `json:"branch"`
 	Connection    string `json:"connection,omitempty"`
@@ -80,6 +83,9 @@ type Job struct {
 	Manifest  string  `json:"manifest,omitempty"`
 	Previous  string  `json:"previous,omitempty"`
 }
+
+// IsUpload reports whether the project deploys uploaded archives.
+func (p Project) IsUpload() bool { return p.Source == "upload" }
 
 type Store struct {
 	Root    string
@@ -167,6 +173,9 @@ func Lock(root string) (func(), error) {
 
 func (s *Store) SaveProject(p Project) (Project, error) {
 	p.EnvDigest, p.Env = "", nil
+	if p.IsUpload() {
+		p.Mode = "manual"
+	}
 	if p.CITimeout == 0 {
 		p.CITimeout = 1800
 	}
