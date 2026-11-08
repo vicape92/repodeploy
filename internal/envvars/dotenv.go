@@ -12,7 +12,7 @@ import (
 // \$. Unquoted values end at " #". Build flags are left unset.
 func ParseDotEnv(text string) ([]Update, error) {
 	var out []Update
-	for n, raw := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+	for n, raw := range strings.Split(strings.ReplaceAll(strings.TrimPrefix(text, "\ufeff"), "\r\n", "\n"), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -26,19 +26,29 @@ func ParseDotEnv(text string) ([]Update, error) {
 		value = strings.TrimSpace(value)
 		switch {
 		case strings.HasPrefix(value, `"`):
-			if len(value) < 2 || !strings.HasSuffix(value, `"`) {
+			end := closingQuote(value, '"')
+			if end < 0 {
 				return nil, fmt.Errorf("line %d: unterminated double quote", n+1)
 			}
-			unquoted, err := unescape(value[1 : len(value)-1])
+			if !onlyComment(value[end+1:]) {
+				return nil, fmt.Errorf("line %d: unexpected text after the closing quote", n+1)
+			}
+			unquoted, err := unescape(value[1:end])
 			if err != nil {
 				return nil, fmt.Errorf("line %d: %v", n+1, err)
 			}
 			value = unquoted
 		case strings.HasPrefix(value, "'"):
-			if len(value) < 2 || !strings.HasSuffix(value, "'") {
+			end := closingQuote(value, '\'')
+			if end < 0 {
 				return nil, fmt.Errorf("line %d: unterminated single quote", n+1)
 			}
-			value = value[1 : len(value)-1]
+			if !onlyComment(value[end+1:]) {
+				return nil, fmt.Errorf("line %d: unexpected text after the closing quote", n+1)
+			}
+			value = value[1:end]
+		case strings.HasPrefix(value, "#"):
+			value = ""
 		default:
 			if i := strings.Index(value, " #"); i >= 0 {
 				value = strings.TrimSpace(value[:i])
@@ -77,4 +87,25 @@ func unescape(s string) (string, error) {
 		}
 	}
 	return b.String(), nil
+}
+
+// closingQuote returns the index of the quote that closes the quoted value
+// starting at s[0], or -1. Double-quoted values skip backslash escapes.
+func closingQuote(s string, quote byte) int {
+	for i := 1; i < len(s); i++ {
+		switch {
+		case s[i] == '\\' && quote == '"':
+			i++
+		case s[i] == quote:
+			return i
+		}
+	}
+	return -1
+}
+
+// onlyComment reports whether the text after a closing quote is blank or a
+// # comment.
+func onlyComment(rest string) bool {
+	rest = strings.TrimSpace(rest)
+	return rest == "" || strings.HasPrefix(rest, "#")
 }

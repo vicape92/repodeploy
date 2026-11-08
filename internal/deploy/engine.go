@@ -394,35 +394,39 @@ const (
 	minFragmentMask = 8
 )
 
+// appendMasks adds the strings to redact for one secret text. Very short
+// fragments ("1", "true", "app") would redact ordinary log text. The whole
+// text is masked from minWholeMask characters; individual lines (the log
+// writer masks line by line, so multi-line values need them) and KEY=value
+// values from minFragmentMask, since config files contain many common lines.
+func appendMasks(masks []string, text string) []string {
+	if whole := strings.TrimSpace(text); len(whole) >= minWholeMask {
+		masks = append(masks, whole)
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) >= minFragmentMask {
+			masks = append(masks, line)
+		}
+		if _, value, ok := strings.Cut(line, "="); ok && len(value) >= minFragmentMask {
+			masks = append(masks, value)
+		}
+	}
+	return masks
+}
+
 func (s *Store) LogWriter(id string) *logWriter {
 	masks := []string{}
 	entries, _ := os.ReadDir(filepath.Join(s.Root, "secrets"))
 	for _, entry := range entries {
 		if !entry.IsDir() && !envvars.IsStoreFile(entry.Name()) {
 			if b, err := os.ReadFile(filepath.Join(s.Root, "secrets", entry.Name())); err == nil && len(b) > 0 {
-				// Very short fragments ("1", "true", "app") would redact ordinary
-				// log text. A whole stored value is masked from minWholeMask
-				// characters; individual lines and KEY=value values from
-				// minFragmentMask, since config files contain many common lines.
-				if whole := strings.TrimSpace(string(b)); len(whole) >= minWholeMask {
-					masks = append(masks, whole)
-				}
-				for _, line := range strings.Split(string(b), "\n") {
-					line = strings.TrimSpace(line)
-					if len(line) >= minFragmentMask {
-						masks = append(masks, line)
-					}
-					if _, value, ok := strings.Cut(line, "="); ok && len(value) >= minFragmentMask {
-						masks = append(masks, value)
-					}
-				}
+				masks = appendMasks(masks, string(b))
 			}
 		}
 	}
 	for _, value := range s.Env.Values() {
-		if value = strings.TrimSpace(value); len(value) >= minWholeMask {
-			masks = append(masks, value)
-		}
+		masks = appendMasks(masks, value)
 	}
 	sort.Slice(masks, func(i, j int) bool { return len(masks[i]) > len(masks[j]) })
 	return &logWriter{store: s, id: id, masks: masks}

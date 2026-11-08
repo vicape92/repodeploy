@@ -52,7 +52,7 @@ func ValidName(name string) bool { return len(name) <= maxNameLen && namePattern
 
 // IsStoreFile reports whether a file name in the store directory belongs to
 // this module, so other readers of that directory can skip it.
-func IsStoreFile(name string) bool { return strings.HasSuffix(name, fileSuffix) }
+func IsStoreFile(name string) bool { return strings.Contains(name, fileSuffix) }
 
 // Store keeps one 0600 JSON file per project in dir.
 type Store struct {
@@ -195,7 +195,8 @@ func writePrivate(path string, b []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".env-")
+	// The temporary name contains fileSuffix so IsStoreFile recognises it.
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-")
 	if err != nil {
 		return err
 	}

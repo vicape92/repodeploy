@@ -14,8 +14,8 @@ import (
 // SelectFiles lists the files "repodeploy up" sends from dir as sorted,
 // slash-separated paths. Inside a Git work tree it uses git ls-files, which
 // honours .gitignore; elsewhere it walks the tree. .repodeployignore applies
-// in both cases. .git/, .repodeploy/ and .env files are never sent; skipped
-// .env files are returned separately so the caller can suggest env import.
+// in both cases. .git/, .repodeploy/, .env files and .envrc are never sent; skipped
+// env files are returned separately so the caller can suggest env import.
 func SelectFiles(dir string) (files, envFiles []string, err error) {
 	candidates, err := gitFiles(dir)
 	if err != nil {
@@ -35,7 +35,7 @@ func SelectFiles(dir string) (files, envFiles []string, err error) {
 		if top := strings.SplitN(rel, "/", 2)[0]; top == ".git" || top == ".repodeploy" {
 			continue
 		}
-		if base := path.Base(rel); base == ".env" || strings.HasPrefix(base, ".env.") {
+		if base := path.Base(rel); base == ".env" || base == ".envrc" || strings.HasPrefix(base, ".env.") {
 			envFiles = append(envFiles, rel)
 			continue
 		}

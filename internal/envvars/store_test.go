@@ -97,6 +97,13 @@ func TestValuesCoverEveryProjectAndIgnoreOtherFiles(t *testing.T) {
 	if !reflect.DeepEqual(values, []string{"alpha-secret", "beta-secret"}) {
 		t.Fatalf("values: %v", values)
 	}
+	os.WriteFile(filepath.Join(dir, "p1.env.json.tmp-123"), []byte(`[{"name":"X","value":"stray-secret"}]`), 0600)
+	if got := s.Values(); len(got) != 2 {
+		t.Fatalf("temp file values leaked: %v", got)
+	}
+	if !IsStoreFile("p1.env.json.tmp-123") {
+		t.Fatal("temp files must be recognised as store files")
+	}
 	if !IsStoreFile("p1.env.json") || IsStoreFile("p1-tls") {
 		t.Fatal("store file detection")
 	}

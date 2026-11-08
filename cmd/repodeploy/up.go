@@ -62,10 +62,13 @@ type apiClient struct {
 	http  *http.Client
 }
 
-func (c apiClient) do(ctx context.Context, method, path, contentType string, body io.Reader) (*http.Response, error) {
+func (c apiClient) do(ctx context.Context, method, path, contentType string, body io.Reader, contentLength int64) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(c.base, "/")+path, body)
 	if err != nil {
 		return nil, err
+	}
+	if contentLength > 0 {
+		req.ContentLength = contentLength
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	if contentType != "" {
@@ -85,7 +88,7 @@ func (c apiClient) do(ctx context.Context, method, path, contentType string, bod
 
 func (c apiClient) job(ctx context.Context, id string) (deploy.Job, error) {
 	var j deploy.Job
-	resp, err := c.do(ctx, http.MethodGet, "/api/jobs/"+url.PathEscape(id), "", nil)
+	resp, err := c.do(ctx, http.MethodGet, "/api/jobs/"+url.PathEscape(id), "", nil, 0)
 	if err != nil {
 		return j, err
 	}
@@ -143,7 +146,7 @@ func up(ctx context.Context, c apiClient, args []string, out io.Writer) error {
 	if o.force {
 		path += "?force=1"
 	}
-	resp, err := c.do(ctx, http.MethodPost, path, "application/octet-stream", archive)
+	resp, err := c.do(ctx, http.MethodPost, path, "application/octet-stream", archive, size)
 	if err != nil {
 		return err
 	}
@@ -171,7 +174,7 @@ func up(ctx context.Context, c apiClient, args []string, out io.Writer) error {
 	if o.detach {
 		return nil
 	}
-	resp, err = c.do(ctx, http.MethodGet, "/api/jobs/"+url.PathEscape(j.ID)+"/logs?follow=1", "", nil)
+	resp, err = c.do(ctx, http.MethodGet, "/api/jobs/"+url.PathEscape(j.ID)+"/logs?follow=1", "", nil, 0)
 	if err != nil {
 		return err
 	}

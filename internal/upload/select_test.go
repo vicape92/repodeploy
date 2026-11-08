@@ -58,6 +58,7 @@ func TestSelectFilesInGitRepository(t *testing.T) {
 		"dist/bundle.js":         "ignored by git",
 		".env":                   "SECRET=1",
 		"config/.env.production": "SECRET=2",
+		".envrc":                 "export TOKEN=1",
 		"notes.tmp":              "ignored by .repodeployignore",
 		".repodeployignore":      "*.tmp\n",
 		".repodeploy/project":    "abc",
@@ -71,7 +72,7 @@ func TestSelectFilesInGitRepository(t *testing.T) {
 	if want := []string{".gitignore", ".repodeployignore", "Dockerfile", "src/app.js"}; !reflect.DeepEqual(files, want) {
 		t.Fatalf("files %v", files)
 	}
-	if want := []string{".env", "config/.env.production"}; !reflect.DeepEqual(envFiles, want) {
+	if want := []string{".env", ".envrc", "config/.env.production"}; !reflect.DeepEqual(envFiles, want) {
 		t.Fatalf("env files %v", envFiles)
 	}
 }

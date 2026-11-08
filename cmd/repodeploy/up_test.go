@@ -73,6 +73,9 @@ func TestUpFollowsLogsAndFailsWhenTheDeploymentFails(t *testing.T) {
 		switch {
 		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/uploads"):
 			io.Copy(io.Discard, r.Body)
+			if r.ContentLength <= 0 || len(r.TransferEncoding) != 0 {
+				t.Errorf("upload is chunked: length %d, encoding %v", r.ContentLength, r.TransferEncoding)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(202)
 			w.Write([]byte(`{"id":"job1","phase":"queued"}`))

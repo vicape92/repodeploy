@@ -117,3 +117,28 @@ func TestDeleteProjectRemovesOnlyItsVariables(t *testing.T) {
 		t.Fatal("another project's variables were deleted")
 	}
 }
+
+func TestLogWriterRedactsEachLineOfMultiLineValues(t *testing.T) {
+	s := testStore(t)
+	p := testProject(t, s)
+	pem := "-----BEGIN KEY-----\nMIIEvQIBADANBgkqhkiG9w0B\nAQEFAASCBKcwggSjAgEAAoIBAQC7\n-----END KEY-----"
+	if err := s.Env.Set(p.ID, []envvars.Update{{Name: "PRIVATE_KEY", Value: pem}}); err != nil {
+		t.Fatal(err)
+	}
+	j, err := s.Enqueue(p.ID, "manual", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := s.LogWriter(j.ID)
+	fmt.Fprintln(w, pem)
+	w.Close()
+	logs, _ := s.Logs(j.ID)
+	for _, line := range strings.Split(pem, "\n") {
+		if strings.Contains(logs, line) {
+			t.Fatalf("line %q not redacted: %q", line, logs)
+		}
+	}
+	if !strings.Contains(logs, "[REDACTED]") {
+		t.Fatalf("nothing redacted: %q", logs)
+	}
+}
