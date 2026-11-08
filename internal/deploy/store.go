@@ -15,6 +15,7 @@ import (
 
 	"github.com/vicape92/repodeploy/internal/envvars"
 	"github.com/vicape92/repodeploy/internal/scm"
+	"github.com/vicape92/repodeploy/internal/upload"
 
 	_ "modernc.org/sqlite"
 )
@@ -91,6 +92,7 @@ type Store struct {
 	Root    string
 	Sources *scm.Manager
 	Env     *envvars.Store
+	Uploads *upload.Store
 	db      *sql.DB
 	logMu   sync.Mutex
 }
@@ -117,7 +119,7 @@ func OpenStore(root string) (*Store, error) {
 	if err = os.Chmod(root, 0700); err != nil {
 		return nil, err
 	}
-	for _, sub := range []string{"releases", "logs", "secrets"} {
+	for _, sub := range []string{"releases", "logs", "secrets", "uploads"} {
 		if err = os.MkdirAll(filepath.Join(root, sub), 0700); err != nil {
 			return nil, err
 		}
@@ -136,7 +138,7 @@ func OpenStore(root string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("unsupported database schema version %d; use a matching binary or restore its backup", version)
 	}
-	s := &Store{Root: root, db: db, Sources: scm.New(root), Env: envvars.New(filepath.Join(root, "secrets"))}
+	s := &Store{Root: root, db: db, Sources: scm.New(root), Env: envvars.New(filepath.Join(root, "secrets")), Uploads: upload.New(filepath.Join(root, "uploads"))}
 	_, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
  CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, config TEXT NOT NULL, active TEXT NOT NULL DEFAULT '', paused INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0, poll_error TEXT NOT NULL DEFAULT '');
  CREATE TABLE IF NOT EXISTS jobs(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,project_id TEXT NOT NULL REFERENCES projects(id),snapshot TEXT NOT NULL,source TEXT NOT NULL,sha TEXT NOT NULL DEFAULT '',rollback TEXT NOT NULL DEFAULT '',phase TEXT NOT NULL DEFAULT 'queued',created TEXT NOT NULL,started TEXT NOT NULL DEFAULT '',finished TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',recovery TEXT NOT NULL DEFAULT '',manifest TEXT NOT NULL DEFAULT '',previous TEXT NOT NULL DEFAULT '',retained INTEGER NOT NULL DEFAULT 1);
@@ -284,13 +286,13 @@ func (s *Store) Enqueue(project, source, event, sha, rollback string) (Job, erro
 			return Job{}, err
 		}
 	}
-	if existing == "" && source != "manual" && sha != "" {
+	if existing == "" && !userSource(source) && sha != "" {
 		err = tx.QueryRow(`SELECT job FROM observed WHERE project_id=? AND sha=?`, project, sha).Scan(&existing)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return Job{}, err
 		}
 	}
-	if existing == "" && source != "manual" && sha != "" && p.Active != "" {
+	if existing == "" && !userSource(source) && sha != "" && p.Active != "" {
 		var activeSHA string
 		if err = tx.QueryRow(`SELECT sha FROM jobs WHERE id=?`, p.Active).Scan(&activeSHA); err != nil {
 			return Job{}, err
@@ -300,7 +302,7 @@ func (s *Store) Enqueue(project, source, event, sha, rollback string) (Job, erro
 		}
 	}
 	if existing == "" {
-		if (p.Paused && source != "manual") || (p.Blocked && rollback == "") {
+		if (p.Paused && !userSource(source)) || (p.Blocked && rollback == "") {
 			return Job{}, ErrPaused
 		}
 		existing = newID()
@@ -309,7 +311,7 @@ func (s *Store) Enqueue(project, source, event, sha, rollback string) (Job, erro
 			return Job{}, err
 		}
 	}
-	if sha != "" && source != "manual" {
+	if sha != "" && !userSource(source) {
 		if _, err = tx.Exec(`DELETE FROM observed WHERE project_id=?`, project); err != nil {
 			return Job{}, err
 		}
@@ -330,7 +332,7 @@ func (s *Store) Enqueue(project, source, event, sha, rollback string) (Job, erro
 }
 
 func (s *Store) Claim() (Job, error) {
-	row := s.db.QueryRow(`UPDATE jobs SET phase='preparing',started=CASE WHEN started='' THEN ? ELSE started END WHERE seq=(SELECT j.seq FROM jobs j JOIN projects p ON p.id=j.project_id WHERE j.phase='queued' AND (p.blocked=0 OR j.rollback!='') AND (p.paused=0 OR j.source='manual') AND (j.rollback!='' OR NOT EXISTS(SELECT 1 FROM jobs waiting WHERE waiting.project_id=j.project_id AND waiting.phase='waiting_ci' AND waiting.seq<j.seq)) ORDER BY j.seq LIMIT 1) AND NOT EXISTS(SELECT 1 FROM jobs WHERE phase NOT IN ('queued','waiting_ci','succeeded','failed')) RETURNING `+jobColumns, now())
+	row := s.db.QueryRow(`UPDATE jobs SET phase='preparing',started=CASE WHEN started='' THEN ? ELSE started END WHERE seq=(SELECT j.seq FROM jobs j JOIN projects p ON p.id=j.project_id WHERE j.phase='queued' AND (p.blocked=0 OR j.rollback!='') AND (p.paused=0 OR j.source IN ('manual','upload')) AND (j.rollback!='' OR NOT EXISTS(SELECT 1 FROM jobs waiting WHERE waiting.project_id=j.project_id AND waiting.phase='waiting_ci' AND waiting.seq<j.seq)) ORDER BY j.seq LIMIT 1) AND NOT EXISTS(SELECT 1 FROM jobs WHERE phase NOT IN ('queued','waiting_ci','succeeded','failed')) RETURNING `+jobColumns, now())
 	j, err := scanJob(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNoJob
@@ -378,7 +380,7 @@ func (s *Store) Pause(project string, blocked bool) error {
 	if _, err = tx.Exec(`UPDATE projects SET paused=1,blocked=MAX(blocked,?) WHERE id=?`, blocked, project); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`UPDATE jobs SET phase='failed',error='automation paused',finished=? WHERE project_id=? AND ((source!='manual' AND phase='queued') OR phase='waiting_ci')`, now(), project); err != nil {
+	if _, err = tx.Exec(`UPDATE jobs SET phase='failed',error='automation paused',finished=? WHERE project_id=? AND ((source NOT IN ('manual','upload') AND phase='queued') OR phase='waiting_ci')`, now(), project); err != nil {
 		return err
 	}
 	return tx.Commit()

@@ -511,6 +511,9 @@ func serve(ctx context.Context, root string, args []string, out io.Writer) error
 		return err
 	}
 	defer store.Close()
+	if err = store.Uploads.SweepTemp(24 * time.Hour); err != nil {
+		return err
+	}
 	handler, err := web.New(store, secure)
 	if err != nil {
 		return err

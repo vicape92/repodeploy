@@ -65,6 +65,12 @@ func Backup(root string, w io.Writer) error {
 		}
 		switch parts[0] {
 		case "secrets", "ssh", "logs":
+		case "uploads":
+			// Archives let "deploy changes" rebuild after a restore; in-flight
+			// files are not worth keeping.
+			if len(parts) >= 2 && parts[1] == "tmp" {
+				return filepath.SkipDir
+			}
 		case "releases":
 			// Keep manifests and secret snapshots needed for rollback.
 			if len(parts) >= 3 && parts[2] == "source" {

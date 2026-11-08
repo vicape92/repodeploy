@@ -122,7 +122,7 @@ func (e *Engine) execute(ctx context.Context, j *Job, log io.Writer) error {
 			return err
 		}
 	} else {
-		if j.Source != "manual" {
+		if !userSource(j.Source) {
 			head, err := (Git{Sources: e.Store.Sources}).Resolve(ctx, j.Project)
 			if err != nil {
 				return err
@@ -135,6 +135,9 @@ func (e *Engine) execute(ctx context.Context, j *Job, log io.Writer) error {
 			}
 		}
 		if j.Commit == "" {
+			if j.Project.IsUpload() {
+				return errors.New("upload projects deploy uploaded archives; upload a new version")
+			}
 			j.Commit, err = (Git{Sources: e.Store.Sources}).Resolve(ctx, j.Project)
 			if err != nil {
 				return err
@@ -143,7 +146,11 @@ func (e *Engine) execute(ctx context.Context, j *Job, log io.Writer) error {
 		if err = e.Store.SetPhase(j.ID, "preparing", j.Commit); err != nil {
 			return err
 		}
-		fmt.Fprintf(log, "Commit %s\n", j.Commit)
+		if j.Project.IsUpload() {
+			fmt.Fprintf(log, "Upload %s\n", j.Commit)
+		} else {
+			fmt.Fprintf(log, "Commit %s\n", j.Commit)
+		}
 		if j.Project.WaitCI {
 			if err = e.waitCI(ctx, *j); err != nil {
 				if errors.Is(err, errWaitingCI) {
@@ -153,7 +160,7 @@ func (e *Engine) execute(ctx context.Context, j *Job, log io.Writer) error {
 			}
 		}
 		checkout := filepath.Join(dir, "source")
-		if err = (Git{Sources: e.Store.Sources}).Prepare(ctx, j.Project, j.Commit, checkout); err != nil {
+		if err = e.sourceFor(j.Project).Prepare(ctx, j.Project, j.Commit, checkout); err != nil {
 			return err
 		}
 		if err = e.Store.SetPhase(j.ID, "building", j.Commit); err != nil {
@@ -368,6 +375,9 @@ func (e *Engine) prune(project string) error {
 		if _, err = e.Store.db.Exec(`UPDATE jobs SET retained=0,snapshot='{}',manifest='',error='' WHERE id=?`, j.ID); err != nil {
 			return err
 		}
+	}
+	if p.IsUpload() {
+		return e.Store.pruneUploads(p.ID)
 	}
 	return nil
 }
