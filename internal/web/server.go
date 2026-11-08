@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +20,8 @@ import (
 	"github.com/vicape92/repodeploy/internal/deploy"
 	"github.com/vicape92/repodeploy/internal/scm"
 )
+
+type multipartKey struct{}
 
 type session struct {
 	CSRF    string
@@ -204,7 +207,39 @@ func (s *Server) Handler() http.Handler {
 			}
 			return
 		}
-		if !tokenOK && r.Method != "GET" && r.Method != "HEAD" {
+		uploading := r.Method == http.MethodPost && isUploadPath(r.URL.Path)
+		if uploading {
+			select {
+			case s.uploadSlots <- struct{}{}:
+				defer func() { <-s.uploadSlots }()
+			default:
+				w.Header().Set("Retry-After", "10")
+				http.Error(w, "another upload is being processed; retry shortly", 429)
+				return
+			}
+		}
+		if !tokenOK && uploading && r.Header.Get("X-CSRF-Token") == "" {
+			// Stream the form: the CSRF field must come first so the archive is
+			// never buffered by the standard multipart parser.
+			mr, err := r.MultipartReader()
+			var part *multipart.Part
+			if err == nil {
+				part, err = mr.NextPart()
+			}
+			token := ""
+			if err == nil && part.FormName() == "_csrf" {
+				var b []byte
+				b, err = io.ReadAll(io.LimitReader(part, 256))
+				token = string(b)
+			} else {
+				err = errors.New("csrf field missing")
+			}
+			if err != nil || !equal(token, sess.CSRF) {
+				http.Error(w, "invalid CSRF token", 403)
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), multipartKey{}, mr))
+		} else if !tokenOK && r.Method != "GET" && r.Method != "HEAD" {
 			csrf := r.Header.Get("X-CSRF-Token")
 			if csrf == "" {
 				if err := r.ParseMultipartForm(32 << 20); err != nil {

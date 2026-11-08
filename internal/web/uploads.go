@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"strings"
@@ -20,7 +21,12 @@ func (s *Server) maxUpload() int64 {
 }
 
 func isUploadPath(path string) bool {
-	return strings.HasSuffix(path, "/uploads") && (strings.HasPrefix(path, "/api/projects/") || strings.HasPrefix(path, "/projects/"))
+	rest, ok := strings.CutPrefix(path, "/api/projects/")
+	if !ok {
+		rest, ok = strings.CutPrefix(path, "/projects/")
+	}
+	id, ok2 := strings.CutSuffix(rest, "/uploads")
+	return ok && ok2 && id != "" && !strings.Contains(id, "/")
 }
 
 // humanBytes renders a size limit for messages, for example "200 MB".
@@ -65,23 +71,14 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		fail(400, "this project deploys from Git; create an upload project for manual uploads")
 		return
 	}
-	select {
-	case s.uploadSlots <- struct{}{}:
-		defer func() { <-s.uploadSlots }()
-	default:
-		w.Header().Set("Retry-After", "10")
-		fail(429, "another upload is being processed; retry shortly")
-		return
-	}
-	body, force := io.Reader(r.Body), r.URL.Query().Get("force") == "1"
+	force := r.URL.Query().Get("force") == "1"
+	var mr *multipart.Reader
 	if browser {
-		file, _, err := r.FormFile("file")
-		if err != nil {
+		var ok bool
+		if mr, ok = r.Context().Value(multipartKey{}).(*multipart.Reader); !ok {
 			fail(400, "choose a .zip or .tar.gz file to upload")
 			return
 		}
-		defer file.Close()
-		body, force = file, r.FormValue("force") == "on"
 	}
 	dir, err := s.Store.Uploads.TempDir()
 	if err != nil {
@@ -94,11 +91,20 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.Remove(tmp.Name())
-	n, err := io.Copy(tmp, io.LimitReader(body, s.maxUpload()+1))
+	var n int64
+	if browser {
+		n, force, err = s.copyFormFile(tmp, mr)
+	} else {
+		n, err = io.Copy(tmp, io.LimitReader(r.Body, s.maxUpload()+1))
+	}
 	if closeErr := tmp.Close(); err == nil {
 		err = closeErr
 	}
 	var tooLarge *http.MaxBytesError
+	if errors.Is(err, errNoFile) {
+		fail(400, "choose a .zip or .tar.gz file to upload")
+		return
+	}
 	if n > s.maxUpload() || errors.As(err, &tooLarge) {
 		fail(413, "the archive exceeds the "+humanBytes(s.maxUpload())+" upload limit")
 		return
@@ -139,4 +145,38 @@ func (s *Server) renderUploadError(w http.ResponseWriter, r *http.Request, p dep
 	}
 	view.UploadError = message
 	s.renderStatus(w, r, status, view)
+}
+
+var errNoFile = errors.New("no file part")
+
+// copyFormFile streams the "file" part of a multipart form into dst and
+// reads the "force" flag, which may follow the file. Other parts are ignored
+// with a bounded read.
+func (s *Server) copyFormFile(dst io.Writer, mr *multipart.Reader) (n int64, force bool, err error) {
+	got := false
+	for {
+		part, perr := mr.NextPart()
+		if perr == io.EOF {
+			break
+		}
+		if perr != nil {
+			return n, force, perr
+		}
+		switch {
+		case part.FormName() == "file" && !got:
+			got = true
+			if n, err = io.Copy(dst, io.LimitReader(part, s.maxUpload()+1)); err != nil || n > s.maxUpload() {
+				return n, force, err
+			}
+		case part.FormName() == "force":
+			b, _ := io.ReadAll(io.LimitReader(part, 1024))
+			force = string(b) == "on"
+		default:
+			io.Copy(io.Discard, io.LimitReader(part, 1024))
+		}
+	}
+	if !got {
+		return 0, force, errNoFile
+	}
+	return n, force, nil
 }

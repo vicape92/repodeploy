@@ -232,3 +232,88 @@ func TestBrowserUploadNeedsCSRFAndShowsTheForm(t *testing.T) {
 		t.Fatalf("oversized browser upload: %d", rec.Code)
 	}
 }
+
+func TestIsUploadPathMatchesExactly(t *testing.T) {
+	for path, want := range map[string]bool{
+		"/api/projects/abc/uploads":   true,
+		"/projects/abc/uploads":       true,
+		"/api/projects//uploads":      false,
+		"/projects//uploads":          false,
+		"/projects/a/b/uploads":       false,
+		"/api/projects/a/b/uploads":   false,
+		"/projects/abc/uploads/extra": false,
+		"/other/abc/uploads":          false,
+		"/projects/uploads":           false,
+	} {
+		if got := isUploadPath(path); got != want {
+			t.Errorf("%s: got %v want %v", path, got, want)
+		}
+	}
+}
+
+func TestProjectPageHasOneHistoryHeadingAndCSRFFirst(t *testing.T) {
+	server, h, _ := webFixture(t)
+	up := savedUploadProject(t, server)
+	git := savedProject(t, server)
+	client, _ := loggedBrowser(t, h.URL)
+	for _, id := range []string{up.ID, git.ID} {
+		resp, _ := client.Get(h.URL + "/projects/" + id)
+		page := readBody(t, resp.Body)
+		if n := strings.Count(page, "Deployment history"); n != 1 {
+			t.Fatalf("%s: heading appears %d times", id, n)
+		}
+	}
+	resp, _ := client.Get(h.URL + "/projects/" + up.ID)
+	page := readBody(t, resp.Body)
+	form := page[strings.Index(page, `action="/projects/`+up.ID+`/uploads"`):]
+	if c, f := strings.Index(form, `name="_csrf"`), strings.Index(form, `name="file"`); c < 0 || f < 0 || c > f {
+		t.Fatal("_csrf must precede the file input")
+	}
+}
+
+func TestBrowserUploadForceAfterFileAndFileFirstIs403(t *testing.T) {
+	server, h, _ := webFixture(t)
+	p := savedUploadProject(t, server)
+	client, csrf := loggedBrowser(t, h.URL)
+	archive := archiveBytes(t, map[string]string{"Dockerfile": "FROM scratch"})
+	send := func(csrfFirst, force bool) *http.Response {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		if csrfFirst {
+			mw.WriteField("_csrf", csrf)
+		}
+		fw, _ := mw.CreateFormFile("file", "site.tar.gz")
+		fw.Write(archive)
+		if force {
+			mw.WriteField("force", "on")
+		}
+		mw.Close()
+		req, _ := http.NewRequest("POST", h.URL+"/projects/"+p.ID+"/uploads", &body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		readBody(t, resp.Body)
+		return resp
+	}
+	if resp := send(false, false); resp.StatusCode != 403 {
+		t.Fatalf("file first: %d", resp.StatusCode)
+	}
+	first := send(true, false)
+	if first.StatusCode != 303 || !strings.HasPrefix(first.Header.Get("Location"), "/jobs/") {
+		t.Fatalf("first: %d %s", first.StatusCode, first.Header.Get("Location"))
+	}
+	jobID := strings.TrimPrefix(first.Header.Get("Location"), "/jobs/")
+	server.Store.Finish(jobID, "succeeded", "", "")
+	server.Store.SetActive(p.ID, jobID)
+	if same := send(true, false); !strings.Contains(same.Header.Get("Location"), "unchanged=1") {
+		t.Fatalf("identical: %d %s", same.StatusCode, same.Header.Get("Location"))
+	}
+	forced := send(true, true)
+	loc := forced.Header.Get("Location")
+	if forced.StatusCode != 303 || !strings.HasPrefix(loc, "/jobs/") || loc == "/jobs/"+jobID {
+		t.Fatalf("forced: %d %s", forced.StatusCode, loc)
+	}
+}
