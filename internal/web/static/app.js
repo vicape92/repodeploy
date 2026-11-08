@@ -38,6 +38,14 @@
     }
   });
 
+  // Matches the "phaseClass" template so live updates keep the same colours.
+  const phaseClass = (phase) => {
+    if (phase === 'succeeded') return 'ok';
+    if (phase === 'failed') return 'failed';
+    if (phase === 'queued' || phase === 'waiting_ci') return 'pending';
+    return 'running';
+  };
+
   // Live deployment logs: <pre data-log-stream="/api/jobs/ID/logs?follow=1">.
   const logs = document.querySelector('[data-log-stream]');
   if (logs) {
@@ -46,7 +54,11 @@
     stream.onmessage = (event) => {
       const data = JSON.parse(event.data);
       logs.textContent += data.log;
-      if (phase) phase.textContent = data.phase;
+      logs.scrollTop = logs.scrollHeight;
+      if (phase && data.phase) {
+        phase.textContent = data.phase;
+        phase.className = 'status ' + phaseClass(data.phase);
+      }
     };
     stream.addEventListener('done', () => {
       stream.close();
@@ -56,8 +68,9 @@
     stream.onerror = () => {
       stream.close();
       const note = document.createElement('p');
+      note.className = 'notice';
       note.textContent = 'Log stream disconnected. Reload to reconnect.';
-      logs.after(note);
+      (logs.closest('.terminal') || logs).after(note);
     };
   }
 
