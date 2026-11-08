@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vicape92/repodeploy/internal/envvars"
 )
 
 type Runtime interface {
@@ -113,11 +115,7 @@ func (e *Engine) execute(ctx context.Context, j *Job, log io.Writer) error {
 		}
 		j.Commit = target.Commit
 		j.Project = target.Project
-		snapshot, err := marshal(j.Project)
-		if err != nil {
-			return err
-		}
-		if _, err = e.Store.db.Exec(`UPDATE jobs SET snapshot=? WHERE id=?`, snapshot, j.ID); err != nil {
+		if err = e.Store.SetSnapshot(j.ID, j.Project); err != nil {
 			return err
 		}
 		if err = e.Store.SetPhase(j.ID, "building", j.Commit); err != nil {
@@ -159,6 +157,14 @@ func (e *Engine) execute(ctx context.Context, j *Job, log io.Writer) error {
 			return err
 		}
 		if err = e.Store.SetPhase(j.ID, "building", j.Commit); err != nil {
+			return err
+		}
+		vars, err := e.Store.Env.List(j.ProjectID)
+		if err != nil {
+			return err
+		}
+		j.Project.Env, j.Project.EnvDigest = vars, envvars.Digest(vars)
+		if err = e.Store.SetSnapshot(j.ID, j.Project); err != nil {
 			return err
 		}
 		fmt.Fprintln(log, "Building; the active release is unchanged")
@@ -382,7 +388,7 @@ func (s *Store) LogWriter(id string) *logWriter {
 	masks := []string{}
 	entries, _ := os.ReadDir(filepath.Join(s.Root, "secrets"))
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() && !envvars.IsStoreFile(entry.Name()) {
 			if b, err := os.ReadFile(filepath.Join(s.Root, "secrets", entry.Name())); err == nil && len(b) > 0 {
 				// Very short fragments ("1", "true", "app") would redact ordinary
 				// log text. A whole stored value is masked from minWholeMask
@@ -401,6 +407,11 @@ func (s *Store) LogWriter(id string) *logWriter {
 					}
 				}
 			}
+		}
+	}
+	for _, value := range s.Env.Values() {
+		if value = strings.TrimSpace(value); len(value) >= minWholeMask {
+			masks = append(masks, value)
 		}
 	}
 	sort.Slice(masks, func(i, j int) bool { return len(masks[i]) > len(masks[j]) })

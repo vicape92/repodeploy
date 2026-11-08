@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/vicape92/repodeploy/internal/envvars"
 )
 
 type testRuntime struct {
@@ -20,11 +22,13 @@ type testRuntime struct {
 	failHealth   bool
 	failRecovery bool
 	beforeBuild  func()
+	env          []envvars.Var
 }
 
 func (r *testRuntime) Forget(context.Context, Project, string, io.Writer) error { return nil }
 
 func (r *testRuntime) Build(ctx context.Context, p Project, checkout, dir string, w io.Writer) (string, error) {
+	r.env = p.Env
 	if r.beforeBuild != nil {
 		r.beforeBuild()
 	}

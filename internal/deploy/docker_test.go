@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/vicape92/repodeploy/internal/envvars"
 )
 
 func TestComposeRejectsUnsafeOrUnsupportedFeaturesBeforeExecution(t *testing.T) {
@@ -93,5 +95,39 @@ func TestImageDeclaredVolumesRequireExplicitNamedMounts(t *testing.T) {
 				t.Fatalf("implicit image volume validation: %v", err)
 			}
 		})
+	}
+}
+
+func TestComposeSubstitutesProjectVariables(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte("services:\n  app:\n    image: alpine\n    environment:\n      DB: ${DATABASE_URL}\n    healthcheck:\n      test: ['CMD', 'true']\n"), 0600)
+	p := Project{ID: strings.Repeat("a", 32), ComposeFile: "compose.yaml", HealthService: "app", Env: []envvars.Var{{Name: "DATABASE_URL", Value: "pg://x$y"}}}
+	cfg, err := loadCompose(p, dir, t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := cfg["services"].(map[string]any)["app"].(map[string]any)["environment"].(map[string]any)
+	if env["DB"] != "pg://x$$y" {
+		t.Fatalf("environment: %v", env)
+	}
+	p.Env = nil
+	if _, err := loadCompose(p, dir, t.TempDir(), t.TempDir()); err == nil || !strings.Contains(err.Error(), "DATABASE_URL") {
+		t.Fatalf("missing variable accepted: %v", err)
+	}
+}
+
+func TestDockerfileModeInjectsVariables(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch"), 0600)
+	p := Project{ID: strings.Repeat("a", 32), Dockerfile: "Dockerfile", Port: 18080, ContainerPort: 8080, HealthURL: "http://127.0.0.1:18080/health", Env: []envvars.Var{{Name: "RUNTIME", Value: "r"}, {Name: "PUBLIC", Value: "p", Build: true}}}
+	cfg, err := loadCompose(p, dir, t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := cfg["services"].(map[string]any)["app"].(map[string]any)
+	env := app["environment"].(map[string]any)
+	args := app["build"].(map[string]any)["args"].(map[string]any)
+	if env["RUNTIME"] != "r" || env["PUBLIC"] != "p" || len(args) != 1 || args["PUBLIC"] != "p" {
+		t.Fatalf("env=%v args=%v", env, args)
 	}
 }

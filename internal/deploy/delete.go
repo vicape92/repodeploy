@@ -69,6 +69,9 @@ func (e *Engine) DeleteProject(ctx context.Context, id string, volumes bool) err
 			return err
 		}
 	}
+	if err = e.Store.Env.DeleteProject(p.ID); err != nil {
+		return err
+	}
 	return e.Store.deleteProjectRows(id)
 }
 

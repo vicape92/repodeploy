@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vicape92/repodeploy/internal/envvars"
 	"github.com/vicape92/repodeploy/internal/scm"
 
 	_ "modernc.org/sqlite"
@@ -55,6 +56,12 @@ type Project struct {
 	Blocked       bool   `json:"blocked"`
 	Active        string `json:"active,omitempty"`
 	PollError     string `json:"poll_error,omitempty"`
+	// EnvDigest records, in job snapshots only, the variables a release was
+	// built with. Project settings never store it.
+	EnvDigest string `json:"env_digest,omitempty"`
+	// Env carries the stored variables into the runtime for one build. It is
+	// never persisted.
+	Env []envvars.Var `json:"-"`
 }
 
 type Job struct {
@@ -77,6 +84,7 @@ type Job struct {
 type Store struct {
 	Root    string
 	Sources *scm.Manager
+	Env     *envvars.Store
 	db      *sql.DB
 	logMu   sync.Mutex
 }
@@ -122,7 +130,7 @@ func OpenStore(root string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("unsupported database schema version %d; use a matching binary or restore its backup", version)
 	}
-	s := &Store{Root: root, db: db, Sources: scm.New(root)}
+	s := &Store{Root: root, db: db, Sources: scm.New(root), Env: envvars.New(filepath.Join(root, "secrets"))}
 	_, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
  CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, config TEXT NOT NULL, active TEXT NOT NULL DEFAULT '', paused INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0, poll_error TEXT NOT NULL DEFAULT '');
  CREATE TABLE IF NOT EXISTS jobs(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,project_id TEXT NOT NULL REFERENCES projects(id),snapshot TEXT NOT NULL,source TEXT NOT NULL,sha TEXT NOT NULL DEFAULT '',rollback TEXT NOT NULL DEFAULT '',phase TEXT NOT NULL DEFAULT 'queued',created TEXT NOT NULL,started TEXT NOT NULL DEFAULT '',finished TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',recovery TEXT NOT NULL DEFAULT '',manifest TEXT NOT NULL DEFAULT '',previous TEXT NOT NULL DEFAULT '',retained INTEGER NOT NULL DEFAULT 1);
@@ -158,6 +166,7 @@ func Lock(root string) (func(), error) {
 }
 
 func (s *Store) SaveProject(p Project) (Project, error) {
+	p.EnvDigest, p.Env = "", nil
 	if p.CITimeout == 0 {
 		p.CITimeout = 1800
 	}
@@ -324,6 +333,17 @@ func (s *Store) SetPhase(id, phase, sha string) error {
 	_, err := s.db.Exec(`UPDATE jobs SET phase=?,sha=CASE WHEN ?='' THEN sha ELSE ? END WHERE id=?`, phase, sha, sha, id)
 	return err
 }
+
+// SetSnapshot replaces the project settings recorded for a job.
+func (s *Store) SetSnapshot(id string, p Project) error {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE jobs SET snapshot=? WHERE id=?`, string(b), id)
+	return err
+}
+
 func (s *Store) SetArtifact(id, manifest, previous string) error {
 	_, err := s.db.Exec(`UPDATE jobs SET manifest=?,previous=? WHERE id=?`, manifest, previous, id)
 	return err

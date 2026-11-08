@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vicape92/repodeploy/internal/envvars"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -119,7 +120,16 @@ func loadCompose(p Project, source, dir, secretsDir string) (map[string]any, err
 		if err != nil {
 			return nil, err
 		}
-		cfg = map[string]any{"services": map[string]any{"app": map[string]any{"build": map[string]any{"context": source, "dockerfile": dockerfile}, "ports": []any{publishedPort(p)}, "restart": "unless-stopped"}}}
+		build := map[string]any{"context": source, "dockerfile": dockerfile}
+		app := map[string]any{"build": build, "ports": []any{publishedPort(p)}, "restart": "unless-stopped"}
+		env, args := envvars.ServiceEnv(p.Env)
+		if len(env) > 0 {
+			app["environment"] = env
+		}
+		if len(args) > 0 {
+			build["args"] = args
+		}
+		cfg = map[string]any{"services": map[string]any{"app": app}}
 	} else {
 		path, err := within(source, p.ComposeFile)
 		if err != nil {
@@ -137,8 +147,11 @@ func loadCompose(p Project, source, dir, secretsDir string) (map[string]any, err
 		if err = decoder.Decode(&extra); err != io.EOF {
 			return nil, errors.New("only one Compose document is supported")
 		}
+		if err = envvars.Substitute(cfg, p.Env); err != nil {
+			return nil, err
+		}
 		if !noInterpolation(cfg) {
-			return nil, errors.New("Compose interpolation is unsupported; use explicit values or managed secrets")
+			return nil, errors.New(envvars.InterpolationHelp)
 		}
 		if err = allowed(cfg, "services volumes networks secrets configs"); err != nil {
 			return nil, err
