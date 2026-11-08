@@ -10,12 +10,16 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Store keeps normalised archives at root/<project>/<sha256>.tar.gz and
 // in-flight files under root/tmp.
-type Store struct{ root string }
+type Store struct {
+	root string
+	mu   sync.Mutex
+}
 
 // New returns a store rooted at root (the state's uploads directory).
 func New(root string) *Store { return &Store{root: root} }
@@ -84,6 +88,8 @@ func (s *Store) Save(projectID, archive string, lim Limits) (string, error) {
 		return "", err
 	}
 	hash := hex.EncodeToString(sum.Sum(nil))
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err = os.MkdirAll(filepath.Join(s.root, projectID), 0700); err != nil {
 		return "", err
 	}
@@ -156,6 +162,8 @@ func (s *Store) Prune(projectID string, keep map[string]bool, minAge time.Durati
 	if !validProjectID(projectID) {
 		return errors.New("invalid project ID")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	paths, err := filepath.Glob(filepath.Join(s.root, projectID, "*.tar.gz"))
 	if err != nil {
 		return err
@@ -184,6 +192,8 @@ func (s *Store) DeleteProject(projectID string) error {
 	if !validProjectID(projectID) {
 		return errors.New("invalid project ID")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return os.RemoveAll(filepath.Join(s.root, projectID))
 }
 

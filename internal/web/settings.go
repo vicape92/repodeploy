@@ -17,6 +17,10 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 	fail := func(status int, message string) {
 		s.renderStatus(w, r, status, page{View: "settings", Error: message})
 	}
+	if err := r.ParseForm(); err != nil {
+		fail(400, "Invalid form.")
+		return
+	}
 	auth, err := s.credentials()
 	if err != nil {
 		fail(500, "Administrator credentials are unavailable.")
@@ -45,7 +49,24 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		fail(400, "The new passwords do not match.")
 		return
 	}
-	if err = ChangePassword(s.Store.Root, next); err != nil {
+	if err = validatePassword(next); err != nil {
+		fail(400, err.Error())
+		return
+	}
+	f, err := lockCredentials(s.Store.Root)
+	if err != nil {
+		fail(500, "Administrator credentials are unavailable.")
+		return
+	}
+	current, err := readCredentials(s.Store.Root)
+	if epoch, ok := r.Context().Value(sessionEpochKey{}).(string); err != nil || current.Epoch != auth.Epoch || current.Password != auth.Password || current.Salt != auth.Salt || (ok && epoch != current.Epoch) {
+		unlockCredentials(f)
+		fail(401, "The current password is incorrect.")
+		return
+	}
+	err = saveCredentials(s.Store.Root, newPasswordCredentials(next, current.TokenHash))
+	unlockCredentials(f)
+	if err != nil {
 		fail(400, err.Error())
 		return
 	}

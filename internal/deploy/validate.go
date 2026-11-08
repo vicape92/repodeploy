@@ -106,22 +106,7 @@ func ValidateProject(p Project) error {
 	if p.Retain < 0 || p.Retain > 50 {
 		return fieldErr("retain", "versions to retain must be 1–50 (zero selects 5)")
 	}
-	if p.SSHKey != "" {
-		for field, path := range map[string]string{"ssh_key": p.SSHKey, "known_hosts": p.KnownHosts} {
-			if !filepath.IsAbs(path) {
-				return fieldErr(field, "SSH paths must be absolute")
-			}
-			stat, err := os.Stat(path)
-			if err != nil || !stat.Mode().IsRegular() {
-				return fieldErr(field, "SSH key and known-hosts file must exist and be regular files")
-			}
-		}
-		stat, _ := os.Stat(p.SSHKey)
-		if stat.Mode().Perm()&0077 != 0 {
-			return fieldErr("ssh_key", "SSH private key must not be accessible to group or others")
-		}
-	}
-	return nil
+	return validateSSHFiles(p)
 }
 
 // validateGitSource checks the repository, branch and detection settings of
@@ -146,6 +131,28 @@ func validateGitSource(p Project) error {
 	}
 	if (p.Mode == "webhook" || p.Mode == "both") && githubRepo(p.Repo) == "" {
 		return fieldErr("mode", "webhook mode currently supports github.com repositories only")
+	}
+	return nil
+}
+
+func validateSSHFiles(p Project) error {
+	if p.SSHKey != "" {
+		for field, path := range map[string]string{"ssh_key": p.SSHKey, "known_hosts": p.KnownHosts} {
+			if !filepath.IsAbs(path) {
+				return fieldErr(field, "SSH paths must be absolute")
+			}
+			stat, err := os.Stat(path)
+			if err != nil || !stat.Mode().IsRegular() {
+				return fieldErr(field, "SSH key and known-hosts file must exist and be regular files")
+			}
+		}
+		stat, err := os.Stat(p.SSHKey)
+		if err != nil {
+			return fieldErr("ssh_key", "SSH key and known-hosts file must exist and be regular files")
+		}
+		if stat.Mode().Perm()&0077 != 0 {
+			return fieldErr("ssh_key", "SSH private key must not be accessible to group or others")
+		}
 	}
 	return nil
 }

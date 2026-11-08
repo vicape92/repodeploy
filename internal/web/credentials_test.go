@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/vicape92/repodeploy/internal/deploy"
 )
@@ -212,4 +214,110 @@ func newTestServer(t *testing.T, server *Server) string {
 	h := httptest.NewServer(server.Handler())
 	t.Cleanup(h.Close)
 	return h.URL
+}
+
+type auditGatedReader struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	data    io.Reader
+}
+
+func (r *auditGatedReader) Read(p []byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return r.data.Read(p)
+}
+
+func TestPasswordChangeRevokesInFlightLogin(t *testing.T) {
+	s, _, _ := webFixture(t)
+	body := &auditGatedReader{
+		started: make(chan struct{}), release: make(chan struct{}),
+		data: strings.NewReader(url.Values{"password": {fixturePassword}}.Encode()),
+	}
+	req := httptest.NewRequest("POST", "http://localhost/login", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { defer close(done); s.Handler().ServeHTTP(response, req) }()
+	<-body.started
+	if err := ChangePassword(s.Store.Root, "new-password-after-revocation"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.credentials(); err != nil {
+		t.Fatal(err)
+	}
+	close(body.release)
+	<-done
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name != s.sessionCookie() {
+			continue
+		}
+		check := httptest.NewRequest("GET", "http://localhost/api/projects", nil)
+		check.AddCookie(cookie)
+		result := httptest.NewRecorder()
+		s.Handler().ServeHTTP(result, check)
+		if result.Code == http.StatusOK {
+			t.Fatal("old password created a valid administrator session after password change and epoch reload")
+		}
+	}
+}
+
+func TestConcurrentPasswordChangePreservesTokenRotation(t *testing.T) {
+	root := t.TempDir()
+	if err := Initialize(root, fixturePassword); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := loadCredentials(root)
+	done := make(chan error, 1)
+	go func() { done <- ChangePassword(root, "new-password-after-rotation") }()
+	time.Sleep(20 * time.Millisecond)
+	token, err := RotateToken(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	current, err := loadCredentials(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.TokenHash != tokenHash(token) {
+		t.Fatalf("successful rotation was lost; previous token restored=%v", current.TokenHash == old.TokenHash)
+	}
+}
+
+func TestSlowLoginBodyDoesNotOccupyPasswordSlot(t *testing.T) {
+	server, _, _ := webFixture(t)
+	body := &auditGatedReader{started: make(chan struct{}), release: make(chan struct{}), data: strings.NewReader("password=incorrect")}
+	req := httptest.NewRequest("POST", "http://localhost/login", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	done := make(chan struct{})
+	go func() { defer close(done); server.Handler().ServeHTTP(httptest.NewRecorder(), req) }()
+	<-body.started
+	occupied := len(server.loginSlots)
+	close(body.release)
+	<-done
+	if occupied != 0 {
+		t.Fatalf("slow request holds %d password verification slots", occupied)
+	}
+}
+
+func TestTokenFileIsAuthoritativeAfterInterruptedRotation(t *testing.T) {
+	root := t.TempDir()
+	if err := Initialize(root, fixturePassword); err != nil {
+		t.Fatal(err)
+	}
+	token := randomToken()
+	if err := writeAtomic(tokenPath(root), []byte(token+"\n")); err != nil {
+		t.Fatal(err)
+	}
+	c, err := loadCredentials(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TokenHash != tokenHash(token) {
+		t.Fatal("atomic token file replacement did not revoke the old token")
+	}
 }

@@ -113,27 +113,28 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		fail(400, "the upload was interrupted")
 		return
 	}
-	hash, err := s.Store.Uploads.Save(p.ID, tmp.Name(), upload.DefaultLimits(s.maxUpload()))
+	j, unchanged, err := s.Store.EnqueueUpload(p.ID, tmp.Name(), upload.DefaultLimits(s.maxUpload()), force)
 	var invalid *upload.Error
 	if errors.As(err, &invalid) {
 		fail(400, invalid.Message)
 		return
 	}
-	if err != nil {
+	if errors.Is(err, deploy.ErrUploadStorage) {
 		fail(500, "cannot store the upload")
 		return
 	}
-	if !force && p.Active != "" {
-		if active, err := s.Store.Job(p.Active); err == nil && active.Commit == hash {
-			if browser {
-				http.Redirect(w, r, "/projects/"+p.ID+"?unchanged=1#upload", 303)
-			} else {
-				jsonResponse(w, 200, active)
-			}
-			return
-		}
+	if err != nil {
+		respondJob(w, r, j, err)
+		return
 	}
-	j, err := s.Store.Enqueue(p.ID, "upload", "", hash, "")
+	if unchanged {
+		if browser {
+			http.Redirect(w, r, "/projects/"+p.ID+"?unchanged=1#upload", 303)
+		} else {
+			jsonResponse(w, 200, j)
+		}
+		return
+	}
 	respondJob(w, r, j, err)
 }
 

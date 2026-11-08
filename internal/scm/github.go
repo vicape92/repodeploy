@@ -22,7 +22,8 @@ import (
 
 func (m *Manager) RegisterGitHub(ctx context.Context, code string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	version := m.githubVersion
+	m.mu.Unlock()
 	if code == "" || len(code) > 200 {
 		return errors.New("invalid GitHub registration code")
 	}
@@ -40,6 +41,11 @@ func (m *Manager) RegisterGitHub(ctx context.Context, code string) error {
 	if _, err := parseRSA(registration.PEM); err != nil {
 		return err
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if version != m.githubVersion {
+		return ErrDisconnected
+	}
 	state, err := m.load()
 	if err != nil {
 		return err
@@ -52,6 +58,8 @@ func (m *Manager) RegisterGitHub(ctx context.Context, code string) error {
 		return err
 	}
 	m.githubAccess = make(map[string]accessToken)
+	m.githubVersion++
+	m.bindings = make(map[string]binding)
 	return nil
 }
 func parseRSA(encoded string) (*rsa.PrivateKey, error) {
@@ -105,8 +113,9 @@ func (m *Manager) GitHubInstallURL(state string) (string, error) {
 }
 func (m *Manager) ConnectGitHub(ctx context.Context, id int64) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	version := m.githubVersion
 	state, err := m.load()
+	m.mu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -134,24 +143,53 @@ func (m *Manager) ConnectGitHub(ctx context.Context, id int64) error {
 			return errors.New("GitHub App must request only read access to contents, metadata, checks and statuses")
 		}
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if version != m.githubVersion {
+		return ErrDisconnected
+	}
+	state, err = m.load()
+	if err != nil {
+		return err
+	}
 	state.GitHub.InstallationID = id
 	if err = m.save(state); err != nil {
 		return err
 	}
 	m.githubAccess = make(map[string]accessToken)
+	m.githubVersion++
+	m.bindings = make(map[string]binding)
 	return nil
 }
 func (m *Manager) githubToken(ctx context.Context, repoID string) (string, error) {
+	m.mu.Lock()
+	cached := m.githubAccess[repoID]
+	m.mu.Unlock()
+	if cached.Value != "" && cached.Expires.After(time.Now().Add(time.Minute)) {
+		return cached.Value, nil
+	}
+	select {
+	case m.githubGate <- struct{}{}:
+		defer func() { <-m.githubGate }()
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	m.mu.Lock()
+	version := m.githubVersion
 	state, err := m.load()
 	if err != nil {
+		m.mu.Unlock()
 		return "", err
 	}
 	if state.GitHub.InstallationID <= 0 {
+		m.mu.Unlock()
 		return "", ErrDisconnected
 	}
 	if cached := m.githubAccess[repoID]; cached.Value != "" && cached.Expires.After(time.Now().Add(time.Minute)) {
+		m.mu.Unlock()
 		return cached.Value, nil
 	}
+	m.mu.Unlock()
 	request := map[string]any{"permissions": map[string]string{"contents": "read", "checks": "read", "statuses": "read"}}
 	if repoID != "" {
 		id, err := strconv.ParseInt(repoID, 10, 64)
@@ -173,6 +211,11 @@ func (m *Manager) githubToken(ctx context.Context, repoID string) (string, error
 	}
 	if token.Value == "" || !token.Expires.After(time.Now()) {
 		return "", errors.New("invalid GitHub installation token")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if version != m.githubVersion {
+		return "", ErrDisconnected
 	}
 	m.githubAccess[repoID] = accessToken{Value: token.Value, Expires: token.Expires}
 	return token.Value, nil

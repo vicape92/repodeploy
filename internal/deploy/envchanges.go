@@ -33,17 +33,24 @@ func (s *Store) EnvPending(p Project) (bool, error) {
 
 // EnqueueConfigChange queues a manual deployment pinned to the active
 // release's commit or upload, so it rebuilds with the current variables.
-func (s *Store) EnqueueConfigChange(projectID string) (Job, error) {
-	p, err := s.Project(projectID)
-	if err != nil {
-		return Job{}, err
-	}
-	if p.Active == "" {
-		return Job{}, ErrNoActive
-	}
-	active, err := s.Job(p.Active)
-	if err != nil {
-		return Job{}, err
-	}
-	return s.Enqueue(projectID, "manual", "", active.Commit, "")
+func (s *Store) EnqueueConfigChange(projectID string) (j Job, err error) {
+	err = s.WithProject(projectID, func(p Project) error {
+		if p.Active == "" {
+			return ErrNoActive
+		}
+		active, err := s.Job(p.Active)
+		if err != nil {
+			return err
+		}
+		j, err = s.enqueue(projectID, "manual", "", active.Commit, "")
+		return err
+	})
+	return
+}
+
+func (s *Store) SetEnv(id string, updates []envvars.Update) error {
+	return s.WithProject(id, func(Project) error { return s.Env.Set(id, updates) })
+}
+func (s *Store) UnsetEnv(id, name string) error {
+	return s.WithProject(id, func(Project) error { return s.Env.Unset(id, name) })
 }

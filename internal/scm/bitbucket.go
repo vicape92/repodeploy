@@ -36,6 +36,8 @@ func (m *Manager) SaveBitbucket(clientID, secret string) error {
 		return err
 	}
 	m.bitbucketAccess = accessToken{}
+	m.bitbucketVersion++
+	m.bindings = make(map[string]binding)
 	return nil
 }
 
@@ -57,34 +59,58 @@ func (m *Manager) BitbucketAuthorizeURL(state, redirectURI string) (string, erro
 }
 
 func (m *Manager) ConnectBitbucket(ctx context.Context, code, redirectURI string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	select {
+	case m.bitbucketGate <- struct{}{}:
+		defer func() { <-m.bitbucketGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	if code == "" || redirectURI == "" {
 		return errors.New("Bitbucket authorization code and redirect URI are required")
 	}
+	m.mu.Lock()
+	version := m.bitbucketVersion
 	state, err := m.load()
+	m.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	_, err = m.bitbucketExchange(ctx, state, url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {redirectURI}})
+	_, err = m.bitbucketExchange(ctx, state, version, url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {redirectURI}})
 	return err
 }
 
 func (m *Manager) bitbucketToken(ctx context.Context) (string, error) {
+	m.mu.Lock()
+	cached := m.bitbucketAccess
+	m.mu.Unlock()
+	if cached.Value != "" && time.Now().Add(30*time.Second).Before(cached.Expires) {
+		return cached.Value, nil
+	}
+	select {
+	case m.bitbucketGate <- struct{}{}:
+		defer func() { <-m.bitbucketGate }()
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	m.mu.Lock()
 	if m.bitbucketAccess.Value != "" && time.Now().Add(30*time.Second).Before(m.bitbucketAccess.Expires) {
-		return m.bitbucketAccess.Value, nil
+		value := m.bitbucketAccess.Value
+		m.mu.Unlock()
+		return value, nil
 	}
 	state, err := m.load()
+	version := m.bitbucketVersion
+	m.mu.Unlock()
 	if err != nil {
 		return "", err
 	}
 	if state.Bitbucket.RefreshToken == "" {
 		return "", ErrDisconnected
 	}
-	return m.bitbucketExchange(ctx, state, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {state.Bitbucket.RefreshToken}})
+	return m.bitbucketExchange(ctx, state, version, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {state.Bitbucket.RefreshToken}})
 }
 
-func (m *Manager) bitbucketExchange(ctx context.Context, state connections, form url.Values) (string, error) {
+func (m *Manager) bitbucketExchange(ctx context.Context, state connections, version uint64, form url.Values) (string, error) {
 	config := state.Bitbucket
 	if config.ClientID == "" || config.ClientSecret == "" {
 		return "", ErrDisconnected
@@ -114,9 +140,22 @@ func (m *Manager) bitbucketExchange(ctx context.Context, state connections, form
 		return "", errors.New("invalid Bitbucket authorization response")
 	}
 	expires := time.Now().Add(time.Duration(response.ExpiresIn) * time.Second)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if version != m.bitbucketVersion {
+		return "", ErrDisconnected
+	}
+	state, err = m.load()
+	if err != nil {
+		return "", err
+	}
 	state.Bitbucket.RefreshToken = response.RefreshToken
 	if err = m.save(state); err != nil {
 		return "", err
+	}
+	if form.Get("grant_type") == "authorization_code" {
+		m.bitbucketVersion++
+		m.bindings = make(map[string]binding)
 	}
 	m.bitbucketAccess = accessToken{Value: response.AccessToken, Expires: expires}
 	return response.AccessToken, nil

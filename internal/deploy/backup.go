@@ -22,6 +22,11 @@ func Backup(root string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+	release, err := lockFile(root, "artifacts.lock", false)
+	if err != nil {
+		return err
+	}
+	defer release()
 	dbPath := filepath.Join(root, "state.db")
 	if _, err = os.Stat(dbPath); err != nil {
 		return errors.New("no state database found; check --state")
@@ -46,10 +51,19 @@ func Backup(root string, w io.Writer) error {
 	if err = addFile(tw, snapshot, "state.db"); err != nil {
 		return err
 	}
-	for _, name := range []string{"admin.json", "admin.token", "connections.json"} {
+	releaseCredentials, err := lockFile(root, "credentials.lock", false)
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"admin.json", "admin.token"} {
 		if err = addFile(tw, filepath.Join(root, name), name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			releaseCredentials()
 			return err
 		}
+	}
+	releaseCredentials()
+	if err = addFile(tw, filepath.Join(root, "connections.json"), "connections.json"); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {

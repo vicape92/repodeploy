@@ -226,3 +226,70 @@ func TestWaitingCIDoesNotBlockClaimsAndSurvivesRecoveryQuery(t *testing.T) {
 		t.Fatalf("project FIFO did not resume: %+v %v", next, err)
 	}
 }
+
+func TestQueueAndHistoryQueriesUseIndexes(t *testing.T) {
+	s := testStore(t)
+	for _, query := range []string{
+		"SELECT seq FROM jobs WHERE phase='queued' ORDER BY seq LIMIT 1",
+		"SELECT id FROM jobs WHERE project_id='p' AND retained=1 ORDER BY seq DESC",
+		"SELECT MAX(seq) FROM jobs WHERE retained=1 GROUP BY project_id",
+	} {
+		rows, err := s.db.Query("EXPLAIN QUERY PLAN " + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		indexed := false
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(detail, "USING") {
+				indexed = true
+			}
+		}
+		rows.Close()
+		if !indexed {
+			t.Errorf("query scans unindexed history: %s", query)
+		}
+	}
+}
+
+func TestInFlightQueueCheckUsesPartialIndex(t *testing.T) {
+	s := testStore(t)
+	rows, err := s.db.Query("PRAGMA index_list(jobs)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var partials []string
+	for rows.Next() {
+		var seq, unique, partial int
+		var name, origin string
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatal(err)
+		}
+		if partial != 0 {
+			partials = append(partials, name)
+		}
+	}
+	rows.Close()
+	rows, err = s.db.Query("EXPLAIN QUERY PLAN SELECT 1 FROM jobs WHERE phase NOT IN ('queued','waiting_ci','succeeded','failed')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range partials {
+			if strings.Contains(detail, "INDEX "+name) {
+				return
+			}
+		}
+	}
+	t.Fatal("idle worker scans terminal history to check whether a job is in flight")
+}

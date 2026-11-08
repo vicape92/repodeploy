@@ -57,16 +57,25 @@ type accessToken struct {
 	Value   string
 	Expires time.Time
 }
+type binding struct {
+	repo    Repository
+	expires time.Time
+	version uint64
+}
+
 type Manager struct {
-	root            string
-	mu              sync.Mutex
-	Client          *http.Client
-	githubAccess    map[string]accessToken
-	bitbucketAccess accessToken
+	root                            string
+	mu                              sync.Mutex
+	Client                          *http.Client
+	githubAccess                    map[string]accessToken
+	bitbucketAccess                 accessToken
+	githubVersion, bitbucketVersion uint64
+	githubGate, bitbucketGate       chan struct{}
+	bindings                        map[string]binding
 }
 
 func New(root string) *Manager {
-	return &Manager{root: root, Client: &http.Client{Timeout: 20 * time.Second}, githubAccess: make(map[string]accessToken)}
+	return &Manager{root: root, Client: &http.Client{Timeout: 20 * time.Second}, githubAccess: make(map[string]accessToken), githubGate: make(chan struct{}, 1), bitbucketGate: make(chan struct{}, 1), bindings: make(map[string]binding)}
 }
 func (m *Manager) load() (connections, error) {
 	var state connections
@@ -148,17 +157,21 @@ func (m *Manager) Disconnect(provider string) error {
 	case "github":
 		state.GitHub.InstallationID = 0
 		m.githubAccess = make(map[string]accessToken)
+		m.githubVersion++
+		m.bindings = make(map[string]binding)
 	case "bitbucket":
 		state.Bitbucket.RefreshToken = ""
 		m.bitbucketAccess = accessToken{}
+		m.bitbucketVersion++
+		m.bindings = make(map[string]binding)
 	default:
 		return errors.New("unsupported provider")
 	}
 	return m.save(state)
 }
 func (m *Manager) Repositories(ctx context.Context, provider, workspace string) ([]Repository, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	switch provider {
 	case "github":
 		return m.githubRepositories(ctx)
@@ -169,8 +182,8 @@ func (m *Manager) Repositories(ctx context.Context, provider, workspace string) 
 	}
 }
 func (m *Manager) Repository(ctx context.Context, provider, id string) (Repository, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	return m.repository(ctx, provider, id)
 }
 
@@ -206,13 +219,13 @@ func (m *Manager) repository(ctx context.Context, provider, id string) (Reposito
 	}
 }
 func (m *Manager) Workspaces(ctx context.Context) ([]Workspace, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	return m.bitbucketWorkspaces(ctx)
 }
 func (m *Manager) Branches(ctx context.Context, provider, id string) ([]string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	switch provider {
 	case "github":
 		return m.githubBranches(ctx, id)
@@ -223,14 +236,40 @@ func (m *Manager) Branches(ctx context.Context, provider, id string) ([]string, 
 	}
 }
 func (m *Manager) Credential(ctx context.Context, provider, id, repoURL string) (Credential, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	repo, err := m.repository(ctx, provider, id)
-	if err != nil {
-		return Credential{}, err
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	canonical, urlProvider, err := CanonicalRepo(repoURL)
+	if err != nil || urlProvider != provider {
+		return Credential{}, errors.New("repository does not match the authorized selection")
 	}
-	canonical, _, err := CanonicalRepo(repoURL)
-	if err != nil || canonical != repo.URL {
+	key := provider + "\x00" + id
+	m.mu.Lock()
+	version := m.githubVersion
+	if provider == "bitbucket" {
+		version = m.bitbucketVersion
+	}
+	cached, ok := m.bindings[key]
+	m.mu.Unlock()
+	if !ok || cached.version != version || time.Now().After(cached.expires) {
+		repo, err := m.repository(ctx, provider, id)
+		if err != nil {
+			return Credential{}, err
+		}
+		if canonical != repo.URL {
+			return Credential{}, errors.New("repository does not match the authorized selection")
+		}
+		m.mu.Lock()
+		current := m.githubVersion
+		if provider == "bitbucket" {
+			current = m.bitbucketVersion
+		}
+		if current != version {
+			m.mu.Unlock()
+			return Credential{}, ErrDisconnected
+		}
+		m.bindings[key] = binding{repo: repo, expires: time.Now().Add(time.Minute), version: version}
+		m.mu.Unlock()
+	} else if canonical != cached.repo.URL {
 		return Credential{}, errors.New("repository does not match the authorized selection")
 	}
 	switch provider {
@@ -244,9 +283,9 @@ func (m *Manager) Credential(ctx context.Context, provider, id, repoURL string) 
 	return Credential{}, ErrDisconnected
 }
 func (m *Manager) CIState(ctx context.Context, provider, id, sha string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !regexp.MustCompile(`^(?:[a-f0-9]{40}|[a-f0-9]{64})$`).MatchString(sha) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if !commitPattern.MatchString(sha) {
 		return "", errors.New("invalid commit")
 	}
 	switch provider {
@@ -259,6 +298,7 @@ func (m *Manager) CIState(ctx context.Context, provider, id, sha string) (string
 	}
 }
 
+var commitPattern = regexp.MustCompile(`^(?:[a-f0-9]{40}|[a-f0-9]{64})$`)
 var repoPartPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 func repoParts(name string) (string, string, error) {

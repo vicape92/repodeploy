@@ -66,7 +66,7 @@ func (s *Server) envSet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "send a JSON list of {name, value, build}", 400)
 		return
 	}
-	if err = s.Store.Env.Set(p.ID, updates); err != nil {
+	if err = s.Store.SetEnv(p.ID, updates); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
 	}
@@ -79,7 +79,7 @@ func (s *Server) envDelete(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	err = s.Store.Env.Unset(p.ID, r.PathValue("name"))
+	err = s.Store.UnsetEnv(p.ID, r.PathValue("name"))
 	if api(r) {
 		switch {
 		case errors.Is(err, envvars.ErrNotFound):
@@ -107,7 +107,7 @@ func (s *Server) envSaveForm(w http.ResponseWriter, r *http.Request) {
 	}
 	build := r.FormValue("build") == "on"
 	value := strings.ReplaceAll(r.FormValue("value"), "\r\n", "\n")
-	if err = s.Store.Env.Set(p.ID, []envvars.Update{{Name: strings.TrimSpace(r.FormValue("name")), Value: value, Build: &build}}); err != nil {
+	if err = s.Store.SetEnv(p.ID, []envvars.Update{{Name: strings.TrimSpace(r.FormValue("name")), Value: value, Build: &build}}); err != nil {
 		s.renderEnvError(w, r, p, err.Error())
 		return
 	}
@@ -123,7 +123,7 @@ func (s *Server) envImportForm(w http.ResponseWriter, r *http.Request) {
 	}
 	updates, err := envvars.ParseDotEnv(r.FormValue("dotenv"))
 	if err == nil {
-		err = s.Store.Env.Set(p.ID, updates)
+		err = s.Store.SetEnv(p.ID, updates)
 	}
 	if err != nil {
 		s.renderEnvError(w, r, p, err.Error())

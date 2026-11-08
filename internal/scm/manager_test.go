@@ -113,3 +113,95 @@ func TestProviderPaginationNeverForwardsTokensToAnotherHost(t *testing.T) {
 		})
 	}
 }
+
+func TestSlowRepositoryListingDoesNotBlockConfiguration(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	m := testManager(t, func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		fmt.Fprint(w, `{"values":[]}`)
+	})
+	m.save(connections{Bitbucket: bitbucketConfig{ClientID: "id", ClientSecret: "secret", RefreshToken: "refresh"}})
+	m.bitbucketAccess = accessToken{Value: "cached", Expires: time.Now().Add(time.Hour)}
+	listing := make(chan error, 1)
+	go func() { _, err := m.Repositories(context.Background(), "bitbucket", "team"); listing <- err }()
+	<-started
+	status := make(chan error, 1)
+	go func() { _, err := m.Status("bitbucket"); status <- err }()
+	select {
+	case err := <-status:
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Error("repository network call holds the configuration mutex")
+	}
+	close(release)
+	if err := <-listing; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDisconnectIsNotUndoneByInFlightRefresh(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	m := testManager(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/site/oauth2/access_token" {
+			close(started)
+			<-release
+			fmt.Fprint(w, `{"access_token":"access","refresh_token":"rotated","expires_in":3600,"scopes":"account repository"}`)
+			return
+		}
+		fmt.Fprint(w, `{"values":[]}`)
+	})
+	m.save(connections{Bitbucket: bitbucketConfig{ClientID: "id", ClientSecret: "secret", RefreshToken: "refresh"}})
+	refresh := make(chan error, 1)
+	go func() { _, err := m.Workspaces(context.Background()); refresh <- err }()
+	<-started
+	disconnected := make(chan error, 1)
+	go func() { disconnected <- m.Disconnect("bitbucket") }()
+	waited := false
+	select {
+	case err := <-disconnected:
+		waited = true
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Error("disconnect waits for token refresh network call")
+	}
+	close(release)
+	<-refresh
+	if !waited {
+		if err := <-disconnected; err != nil {
+			t.Error(err)
+		}
+	}
+	status, err := m.Status("bitbucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Connected {
+		t.Fatal("refresh resurrected disconnected credentials")
+	}
+}
+
+func TestCredentialsCacheVerifiedRepositoryBinding(t *testing.T) {
+	calls := 0
+	m := testManager(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		fmt.Fprint(w, `{"full_name":"team/app","mainbranch":{"name":"main"}}`)
+	})
+	m.save(connections{Bitbucket: bitbucketConfig{ClientID: "id", ClientSecret: "secret", RefreshToken: "refresh"}})
+	m.bitbucketAccess = accessToken{Value: "cached", Expires: time.Now().Add(time.Hour)}
+	for i := 0; i < 3; i++ {
+		if _, err := m.Credential(context.Background(), "bitbucket", "team/app", "https://bitbucket.org/team/app.git"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("cached credentials repeated repository authorization %d times", calls)
+	}
+	if _, err := m.Credential(context.Background(), "bitbucket", "team/app", "https://bitbucket.org/team/other.git"); err == nil {
+		t.Fatal("cache bypassed repository binding")
+	}
+}

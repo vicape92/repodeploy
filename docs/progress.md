@@ -226,3 +226,40 @@ Four blocks applied in order, each test-first against the existing suite.
   (not skipped) and passed for the dockerfile and compose subtests (about 50 s),
   and the full `internal/deploy` suite with `REPODEPLOY_DOCKER_TEST=1` passed
   (about 123 s).
+
+## Security and concurrency corrections — 2026-11-08
+
+Spec: credential updates are serialized across processes, password epochs bind
+sessions, slow bodies expire before occupying password verification slots, and
+IPv6 clients share a /64 login budget. Aggregate password work stays bounded
+without a global minute-long login lockout or an unbounded client table.
+Backups pin referenced artifacts; project deletion, archive/key collection and
+mutations cannot race. Existing project updates never recreate deleted rows.
+Logs redact the actual release inputs, read incrementally and retain a bounded
+writer. CI and repository polling have deadlines and bounded concurrency; SCM
+network calls do not retain the configuration mutex or resurrect disconnected
+credentials. Editing a detection source resets its backoff; stale observations
+are discarded. SSH creation and collection participate in backup exclusion. Queue/history queries use indexes. Retained releases deliberately
+keep their protected secret snapshots for rollback; recovery is tested across
+intermediate state rather than changing its contract.
+
+Acceptance: deterministic regression tests for these interleavings and resource
+limits fail before implementation and pass afterwards; existing behavior,
+race-enabled tests, vet and applicable Docker/SSH/daemon integrations pass.
+No new external dependencies, commits or pushes.
+
+Plan (TDD; work in the requested checkout):
+- [x] Credentials, session epochs, HTTP read deadlines and bounded login limits.
+- [x] SCM cache synchronization, cancellable network work and parallel polling.
+- [x] Artifact pinning, project mutation exclusion, archive/SSH collection.
+- [x] Release-specific log masking, incremental reads and persistent writers.
+- [x] CI isolation, database indexes and crash-recovery regression coverage.
+- [x] Review the complete diff and run integration, race, vet and build checks.
+
+Verification: full race-enabled suite with Docker, SSH and Linux daemon
+integrations: 266 tests/subtests passed, no failures or skips. The final partial
+queue-index and oversized-log-line redaction regressions also passed with the
+race detector after their addition.
+Vet, module verification, gofmt, installer syntax, and Linux arm64/amd64 builds
+passed. Backups briefly exclude artifact mutations while copying; live
+applications keep serving. No commits or pushes performed.

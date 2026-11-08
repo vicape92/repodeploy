@@ -468,3 +468,44 @@ func TestSupersededPollingJobCannotDowngradeCurrentBranch(t *testing.T) {
 		t.Fatalf("superseded polling target activated: %+v %s", j, r.active)
 	}
 }
+
+func TestRecoveryAfterActiveClearStillBlocksFailedRestore(t *testing.T) {
+	e, r, p, repo := engineFixture(t)
+	first := runDeployment(t, e, p)
+	secondCommit(t, repo)
+	j, err := e.Store.Enqueue(p.ID, "manual", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err = e.Store.Claim()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(e.Store.Root, "releases", j.ID)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(dir, "compose.json")
+	os.WriteFile(manifest, []byte("second"), 0600)
+	e.Store.SetArtifact(j.ID, manifest, first.ID)
+	e.Store.SetPhase(j.ID, "checking", "")
+	e.Store.SetActive(p.ID, "")
+	r.failRecovery = true
+	if err := e.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.Store.Project(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Blocked || got.Active != "" {
+		t.Fatalf("interrupted failed recovery was not reconciled: %+v", got)
+	}
+	finished, err := e.Store.Job(j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished.Phase != "failed" || finished.Recovery != "failed" {
+		t.Fatalf("interrupted job not finalized: %+v", finished)
+	}
+}

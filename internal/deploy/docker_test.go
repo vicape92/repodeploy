@@ -1,6 +1,9 @@
 package deploy
 
 import (
+	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,5 +132,36 @@ func TestDockerfileModeInjectsVariables(t *testing.T) {
 	args := app["build"].(map[string]any)["args"].(map[string]any)
 	if env["RUNTIME"] != "r" || env["PUBLIC"] != "p" || len(args) != 1 || args["PUBLIC"] != "p" {
 		t.Fatalf("env=%v args=%v", env, args)
+	}
+}
+
+func TestHealthCheckUsesOneDockerQueryForAllServices(t *testing.T) {
+	for _, format := range []string{"array", "stream"} {
+		t.Run(format, func(t *testing.T) {
+			dir := t.TempDir()
+			calls := filepath.Join(dir, "calls")
+			rows := []string{`{"Service":"app","State":"running","Health":"healthy"}`, `{"Service":"worker","State":"running","Health":"healthy"}`}
+			output := strings.Join(rows, "\n")
+			if format == "array" {
+				output = "[" + strings.Join(rows, ",") + "]"
+			}
+			script := fmt.Sprintf("#!/bin/sh\nprintf 'call\\n' >> '%s'\ncase \"$*\" in *'ps --all --format json'*) printf '%%s\\n' '%s';; *'ps --all --quiet'*) printf 'cid\\n';; *'inspect --format'*) printf '%%s\\n' '{\"Status\":\"running\",\"Health\":{\"Status\":\"healthy\"}}';; *) exit 1;; esac\n", calls, output)
+			if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			manifest := filepath.Join(dir, "compose.json")
+			os.WriteFile(manifest, []byte(`{"services":{"app":{},"worker":{}}}`), 0600)
+			if err := (Docker{}).Healthy(context.Background(), Project{HealthService: "app", HealthTimeout: 1}, manifest, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			b, err := os.ReadFile(calls)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(strings.Fields(string(b))); got != 1 {
+				t.Fatalf("healthy two-service app needed %d Docker processes", got)
+			}
+		})
 	}
 }

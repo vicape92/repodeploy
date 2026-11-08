@@ -187,8 +187,10 @@ names, such as a VPN host name, add `--allowed-hosts name1,name2`.
 
 **Login throttling.** Each client may make 5 sign-in attempts per minute; after
 5 consecutive failures it is locked out for 1 minute, doubling up to 15 minutes.
-A global ceiling of 30 attempts per minute limits distributed guessing. Clients
-are identified by their TCP peer address. Behind a reverse proxy every request
+IPv6 addresses in one /64 share a budget. Password verification is limited to
+two concurrent operations and a bounded queue; traffic from other networks
+cannot exhaust a global minute-long allowance. Client tracking is bounded.
+Clients are identified by their TCP peer address. Behind a reverse proxy every request
 comes from `127.0.0.1`, so add `--trust-proxy`: the rightmost
 `X-Forwarded-For` entry (or `X-Real-IP`) is then used, but only for requests
 from a loopback peer. Without it, all proxied clients share one limit.

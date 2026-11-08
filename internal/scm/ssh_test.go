@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -113,5 +116,49 @@ func TestBitbucketOfficialHostKeySourceMayAlsoContainSSHDomain(t *testing.T) {
 	known, _ := os.ReadFile(generated.KnownHostsPath)
 	if !strings.HasPrefix(string(known), "bitbucket.org ") || strings.Contains(string(known), "ssh.bitbucket.org") {
 		t.Fatalf("unexpected host trust scope: %s", known)
+	}
+}
+
+func TestSSHKeyCreationWaitsForArtifactSnapshot(t *testing.T) {
+	public, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ssh.NewPublicKey(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorized := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+	fetched := make(chan struct{})
+	m := testManager(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"ssh_keys": []string{authorized}})
+		close(fetched)
+	})
+	lock, err := os.OpenFile(filepath.Join(m.root, "artifacts.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { _, err := m.NewSSH(context.Background(), "git@github.com:team/app.git"); result <- err }()
+	<-fetched
+	finished := false
+	select {
+	case err := <-result:
+		finished = true
+		if err != nil {
+			t.Error(err)
+		}
+		t.Error("SSH key files were created during an exclusive backup snapshot")
+	case <-time.After(100 * time.Millisecond):
+	}
+	syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	if !finished {
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
 	}
 }

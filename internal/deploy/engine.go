@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,16 +30,22 @@ type Engine struct {
 	Runtime  Runtime
 	Timeout  time.Duration
 	ciChecks map[string]ciCheck
+	ciMu     sync.Mutex
+	checkMu  sync.Mutex
 	// mu serialises deployment steps with project deletion.
 	mu sync.Mutex
 }
 
 func (e *Engine) Step(ctx context.Context) (bool, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if err := e.recheckCI(ctx); err != nil {
 		return false, err
 	}
+	return e.step(ctx)
+}
+
+func (e *Engine) step(ctx context.Context) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	j, err := e.Store.Claim()
 	if errors.Is(err, ErrNoJob) {
 		return false, nil
@@ -65,7 +72,7 @@ func (e *Engine) Step(ctx context.Context) (bool, error) {
 	if errors.Is(err, errWaitingCI) {
 		return true, nil
 	}
-	delete(e.ciChecks, j.ID)
+	e.forgetCICheck(j.ID)
 	if err == nil {
 		return true, nil
 	}
@@ -76,7 +83,7 @@ func (e *Engine) Step(ctx context.Context) (bool, error) {
 	if latest.Phase == "activating" || latest.Phase == "checking" {
 		recoveryCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
-		return true, e.restore(recoveryCtx, latest, err.Error(), log)
+		return true, e.restore(recoveryCtx, latest, log.Redact(err.Error()), log)
 	}
 	if parent.Err() != nil {
 		return true, parent.Err()
@@ -85,7 +92,7 @@ func (e *Engine) Step(ctx context.Context) (bool, error) {
 		err = errors.New("deployment timeout exceeded")
 	}
 	fmt.Fprintf(log, "Failed: %s\n", err)
-	return true, e.Store.Finish(j.ID, "failed", err.Error(), "")
+	return true, e.Store.Finish(j.ID, "failed", log.Redact(err.Error()), "")
 }
 
 func (e *Engine) execute(ctx context.Context, j *Job, log io.Writer) error {
@@ -115,6 +122,7 @@ func (e *Engine) execute(ctx context.Context, j *Job, log io.Writer) error {
 		}
 		j.Commit = target.Commit
 		j.Project = target.Project
+		maskManifest(log, j.Manifest)
 		if err = e.Store.SetSnapshot(j.ID, j.Project); err != nil {
 			return err
 		}
@@ -128,7 +136,7 @@ func (e *Engine) execute(ctx context.Context, j *Job, log io.Writer) error {
 				return err
 			}
 			if head != j.Commit {
-				if _, err = e.Store.Enqueue(j.ProjectID, "poll", "", head, ""); err != nil {
+				if _, err = e.Store.EnqueueObserved(j.Project, "poll", "", head); err != nil {
 					return err
 				}
 				return errors.New("automatic target superseded by the current branch head; latest target reconciled")
@@ -171,6 +179,11 @@ func (e *Engine) execute(ctx context.Context, j *Job, log io.Writer) error {
 			return err
 		}
 		j.Project.Env, j.Project.EnvDigest = vars, envvars.Digest(vars)
+		if w, ok := log.(interface{ Mask(...string) }); ok {
+			for _, v := range vars {
+				w.Mask(v.Value)
+			}
+		}
 		if err = e.Store.SetSnapshot(j.ID, j.Project); err != nil {
 			return err
 		}
@@ -249,6 +262,15 @@ func copyArtifact(source, dir string) (string, error) {
 }
 
 func (e *Engine) restore(ctx context.Context, j Job, message string, log io.Writer) error {
+	maskManifest(log, j.Manifest)
+	if j.Previous != "" {
+		if previous, err := e.Store.Job(j.Previous); err == nil {
+			maskManifest(log, previous.Manifest)
+		}
+	}
+	if w, ok := log.(interface{ Redact(string) string }); ok {
+		message = w.Redact(message)
+	}
 	fmt.Fprintf(log, "Failed: %s\nRecovering previous release\n", message)
 	result := "removed"
 	var recoveryErr error
@@ -307,23 +329,57 @@ func (e *Engine) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for ctx.Err() == nil {
-		did, err := e.Step(ctx)
+	child, cancel := context.WithCancel(ctx)
+	checkDone := make(chan struct{})
+	checkErrors := make(chan error, 1)
+	go func() {
+		defer close(checkDone)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			if err := e.recheckCI(child); err != nil {
+				if child.Err() == nil {
+					checkErrors <- err
+				}
+				return
+			}
+			select {
+			case <-child.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	defer func() { cancel(); <-checkDone }()
+	for child.Err() == nil {
+		select {
+		case err := <-checkErrors:
+			return err
+		default:
+		}
+		did, err := e.step(child)
 		if err != nil {
 			return err
 		}
 		if !did {
 			select {
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-child.Done():
+				return child.Err()
+			case err := <-checkErrors:
+				return err
 			case <-time.After(500 * time.Millisecond):
 			}
 		}
 	}
-	return ctx.Err()
+	return child.Err()
 }
 
 func (e *Engine) prune(project string) error {
+	unlock, err := lockFile(e.Store.Root, "artifacts.lock", false)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	p, err := e.Store.Project(project)
 	if err != nil {
 		return err
@@ -383,10 +439,16 @@ func (e *Engine) prune(project string) error {
 }
 
 type logWriter struct {
-	store   *Store
-	id      string
-	pending string
-	masks   []string
+	mu         sync.Mutex
+	file       *os.File
+	openErr    error
+	pending    string
+	discarding bool
+	masks      []string
+	replacer   *strings.Replacer
+	dirty      bool
+	size       int64
+	closed     bool
 }
 
 const (
@@ -416,83 +478,237 @@ func appendMasks(masks []string, text string) []string {
 }
 
 func (s *Store) LogWriter(id string) *logWriter {
-	masks := []string{}
-	entries, _ := os.ReadDir(filepath.Join(s.Root, "secrets"))
-	for _, entry := range entries {
-		if !entry.IsDir() && !envvars.IsStoreFile(entry.Name()) {
-			if b, err := os.ReadFile(filepath.Join(s.Root, "secrets", entry.Name())); err == nil && len(b) > 0 {
-				masks = appendMasks(masks, string(b))
+	w := &logWriter{}
+	if !namePattern.MatchString(id) {
+		w.openErr = errors.New("invalid job id")
+		return w
+	}
+	w.file, w.openErr = os.OpenFile(filepath.Join(s.Root, "logs", id+".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if w.openErr == nil {
+		if info, err := w.file.Stat(); err == nil {
+			w.size = info.Size()
+		} else {
+			w.openErr = err
+			w.file.Close()
+			w.file = nil
+		}
+	}
+	if j, err := s.Job(id); err == nil {
+		entries, _ := os.ReadDir(filepath.Join(s.Root, "secrets"))
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasPrefix(entry.Name(), j.ProjectID+"-") {
+				if b, err := os.ReadFile(filepath.Join(s.Root, "secrets", entry.Name())); err == nil {
+					w.Mask(string(b))
+				}
+			}
+		}
+		if vars, err := s.Env.List(j.ProjectID); err == nil {
+			for _, v := range vars {
+				w.Mask(v.Value)
 			}
 		}
 	}
-	for _, value := range s.Env.Values() {
-		masks = appendMasks(masks, value)
-	}
-	sort.Slice(masks, func(i, j int) bool { return len(masks[i]) > len(masks[j]) })
-	return &logWriter{store: s, id: id, masks: masks}
+	return w
 }
+
+func (w *logWriter) Mask(values ...string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, value := range values {
+		w.masks = appendMasks(w.masks, value)
+	}
+	w.dirty = true
+}
+func (w *logWriter) redact(s string) string {
+	if w.dirty {
+		sort.Slice(w.masks, func(i, j int) bool { return len(w.masks[i]) > len(w.masks[j]) })
+		seen := make(map[string]bool, len(w.masks))
+		unique := w.masks[:0]
+		pairs := make([]string, 0, len(w.masks)*2)
+		for _, mask := range w.masks {
+			if !seen[mask] {
+				seen[mask] = true
+				unique = append(unique, mask)
+				pairs = append(pairs, mask, "[REDACTED]")
+			}
+		}
+		w.masks = unique
+		w.replacer = strings.NewReplacer(pairs...)
+		w.dirty = false
+	}
+	if w.replacer != nil {
+		return w.replacer.Replace(s)
+	}
+	return s
+}
+func (w *logWriter) Redact(s string) string { w.mu.Lock(); defer w.mu.Unlock(); return w.redact(s) }
 func (w *logWriter) Write(b []byte) (int, error) {
-	w.pending += string(b)
-	for {
-		line, rest, ok := strings.Cut(w.pending, "\n")
-		if !ok {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, os.ErrClosed
+	}
+	if w.openErr != nil {
+		return 0, w.openErr
+	}
+	n := len(b)
+	for len(b) > 0 {
+		end := bytes.IndexByte(b, '\n')
+		if end < 0 {
+			if !w.discarding {
+				if len(w.pending)+len(b) > 65536 {
+					w.pending = ""
+					w.discarding = true
+				} else {
+					w.pending += string(b)
+				}
+			}
 			break
 		}
-		w.pending = rest
+		line := "[oversized log line omitted]"
+		if !w.discarding && len(w.pending)+end <= 65536 {
+			line = w.pending + string(b[:end])
+		}
+		w.pending = ""
+		w.discarding = false
 		if err := w.append(line + "\n"); err != nil {
 			return 0, err
 		}
+		b = b[end+1:]
 	}
-	if len(w.pending) > 65536 {
-		w.pending = "[oversized log line omitted]"
-	}
-	return len(b), nil
+	return n, nil
 }
 func (w *logWriter) Close() error {
-	if w.pending != "" {
-		err := w.append(w.pending + "\n")
-		w.pending = ""
-		return err
-	}
-	return nil
-}
-func (w *logWriter) append(s string) error {
-	for _, mask := range w.masks {
-		if mask != "" {
-			s = strings.ReplaceAll(s, mask, "[REDACTED]")
-		}
-	}
-	w.store.logMu.Lock()
-	defer w.store.logMu.Unlock()
-	f, err := os.OpenFile(filepath.Join(w.store.Root, "logs", w.id+".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	stat, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	const limit = 1 << 20
-	if stat.Size() >= limit {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
 		return nil
 	}
-	if int64(len(s)) > limit-stat.Size() {
-		s = s[:limit-stat.Size()]
+	w.closed = true
+	err := w.openErr
+	if w.discarding {
+		w.pending = "[oversized log line omitted]"
 	}
-	_, err = io.WriteString(f, s)
+	if err == nil && w.pending != "" {
+		err = w.append(w.pending + "\n")
+		w.pending = ""
+	}
+	if w.file != nil {
+		if closeErr := w.file.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+func (w *logWriter) append(s string) error {
+	s = w.redact(s)
+	const limit = 1 << 20
+	if w.size >= limit {
+		return nil
+	}
+	if int64(len(s)) > limit-w.size {
+		s = s[:limit-w.size]
+	}
+	n, err := io.WriteString(w.file, s)
+	w.size += int64(n)
 	return err
 }
 
+func (s *Store) ReadLogs(id string, offset int64) (string, int64, error) {
+	if !namePattern.MatchString(id) || offset < 0 {
+		return "", 0, errors.New("invalid log request")
+	}
+	f, err := os.Open(filepath.Join(s.Root, "logs", id+".log"))
+	if os.IsNotExist(err) {
+		return "", 0, nil
+	}
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	if offset > info.Size() {
+		offset = 0
+	}
+	if _, err = f.Seek(offset, io.SeekStart); err != nil {
+		return "", 0, err
+	}
+	b, err := io.ReadAll(f)
+	return string(b), offset + int64(len(b)), err
+}
 func (s *Store) Logs(id string) (string, error) {
 	if _, err := s.Job(id); err != nil {
 		return "", err
 	}
-	s.logMu.Lock()
-	defer s.logMu.Unlock()
-	b, err := os.ReadFile(filepath.Join(s.Root, "logs", id+".log"))
-	if os.IsNotExist(err) {
-		return "", nil
+	text, _, err := s.ReadLogs(id, 0)
+	return text, err
+}
+
+func maskManifest(log io.Writer, path string) {
+	w, ok := log.(interface{ Mask(...string) })
+	if !ok || path == "" {
+		return
 	}
-	return string(b), err
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var cfg map[string]any
+	if json.Unmarshal(b, &cfg) != nil {
+		return
+	}
+	var walk func(any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			for k, value := range x {
+				if k == "environment" || k == "args" {
+					maskValues(w, value)
+				} else {
+					walk(value)
+				}
+			}
+		case []any:
+			for _, value := range x {
+				walk(value)
+			}
+		}
+	}
+	walk(cfg)
+	for _, kind := range []string{"secrets", "configs"} {
+		entries, _ := cfg[kind].(map[string]any)
+		for _, entry := range entries {
+			m, _ := entry.(map[string]any)
+			file, _ := m["file"].(string)
+			rel, err := filepath.Rel(filepath.Dir(path), file)
+			if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				if b, err := os.ReadFile(file); err == nil {
+					w.Mask(string(b))
+				}
+			}
+		}
+	}
+}
+func maskValues(w interface{ Mask(...string) }, v any) {
+	switch x := v.(type) {
+	case string:
+		if _, value, ok := strings.Cut(x, "="); ok {
+			w.Mask(value, strings.ReplaceAll(value, "$$", "$"))
+		} else {
+			w.Mask(x, strings.ReplaceAll(x, "$$", "$"))
+		}
+	case map[string]any:
+		for _, value := range x {
+			if s, ok := value.(string); ok {
+				w.Mask(s, strings.ReplaceAll(s, "$$", "$"))
+			}
+		}
+	case []any:
+		for _, value := range x {
+			maskValues(w, value)
+		}
+	}
 }

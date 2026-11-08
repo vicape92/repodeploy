@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -33,8 +34,6 @@ type SSHKey struct {
 var sshKeyIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
 
 func (m *Manager) NewSSH(ctx context.Context, repo string) (SSHKey, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	_, provider, err := CanonicalRepo(repo)
 	if err != nil {
 		return SSHKey{}, err
@@ -60,6 +59,18 @@ func (m *Manager) NewSSH(ctx context.Context, repo string) (SSHKey, error) {
 		return SSHKey{}, err
 	}
 	id := hex.EncodeToString(idBytes)
+	if err := os.MkdirAll(m.root, 0700); err != nil {
+		return SSHKey{}, err
+	}
+	lock, err := os.OpenFile(filepath.Join(m.root, "artifacts.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return SSHKey{}, err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_SH); err != nil {
+		return SSHKey{}, err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	parent := filepath.Join(m.root, "ssh")
 	if err := os.MkdirAll(parent, 0700); err != nil {
 		return SSHKey{}, err

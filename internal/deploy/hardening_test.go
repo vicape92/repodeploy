@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -183,5 +184,119 @@ func TestLogMaskingIgnoresShortFragments(t *testing.T) {
 	logs, _ := s.Logs(j.ID)
 	if logs != "step 1 of 3: true port 8080 pin [REDACTED] key [REDACTED]\n" {
 		t.Fatalf("unexpected masking: %q", logs)
+	}
+}
+
+func TestReadLogsIncrementalAndTruncation(t *testing.T) {
+	s := testStore(t)
+	p := testProject(t, s)
+	j, err := s.Enqueue(p.ID, "manual", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(s.Root, "logs", j.ID+".log")
+	if err = os.WriteFile(path, []byte("first"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	text, offset, err := s.ReadLogs(j.ID, 0)
+	if err != nil || text != "first" || offset != 5 {
+		t.Fatalf("%q %d %v", text, offset, err)
+	}
+	if err = os.WriteFile(path, []byte("new"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	text, offset, err = s.ReadLogs(j.ID, offset)
+	if err != nil || text != "new" || offset != 3 {
+		t.Fatalf("%q %d %v", text, offset, err)
+	}
+	if _, _, err = s.ReadLogs("../escape", 0); err == nil {
+		t.Fatal("accepted unsafe id")
+	}
+}
+
+func TestManifestMasksRetainedEnvironmentAndSecrets(t *testing.T) {
+	s := testStore(t)
+	p := testProject(t, s)
+	j, err := s.Enqueue(p.ID, "manual", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	secret := filepath.Join(dir, "secret")
+	if err = os.WriteFile(secret, []byte("old-secret-value"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(dir, "compose.json")
+	data := fmt.Sprintf(`{"services":{"app":{"environment":{"TOKEN":"old-env-value"},"build":{"args":{"TOKEN":"old-build-value"}}}},"secrets":{"key":{"file":%q}}}`, secret)
+	if err = os.WriteFile(manifest, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	w := s.LogWriter(j.ID)
+	maskManifest(w, manifest)
+	fmt.Fprintln(w, "old-env-value old-build-value old-secret-value")
+	if err = w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	text, err := s.Logs(j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(text, "old-") || strings.Count(text, "[REDACTED]") != 3 {
+		t.Fatalf("unmasked snapshot: %q", text)
+	}
+}
+
+func TestLogWriterMasksLiteralDollarsFromRetainedManifest(t *testing.T) {
+	s := testStore(t)
+	p := testProject(t, s)
+	j, err := s.Enqueue(p.ID, "manual", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(t.TempDir(), "compose.json")
+	if err := os.WriteFile(manifest, []byte(`{"services":{"app":{"environment":{"TOKEN":"old$$secret-value"}}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	w := s.LogWriter(j.ID)
+	maskManifest(w, manifest)
+	w.Write([]byte("old$secret-value\n"))
+	w.Close()
+	text, err := s.Logs(j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(text, "old$secret-value") {
+		t.Fatal("retained Compose interpolation escape prevented masking the actual secret")
+	}
+}
+
+func TestOversizedLogLineCannotExposeSecretSuffix(t *testing.T) {
+	s := testStore(t)
+	p := testProject(t, s)
+	j, err := s.Enqueue(p.ID, "manual", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := strings.Repeat("private-secret-", 8000)
+	w := s.LogWriter(j.ID)
+	w.Mask(secret)
+	for rest := secret; len(rest) > 0; {
+		n := min(len(rest), 32000)
+		if _, err := w.Write([]byte(rest[:n])); err != nil {
+			t.Fatal(err)
+		}
+		rest = rest[n:]
+	}
+	w.Write([]byte("\nnext line\n"))
+	w.Close()
+	text, err := s.Logs(j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(text, "private-secret") {
+		t.Fatal("oversized line exposed the suffix of a masked secret")
+	}
+	if !strings.Contains(text, "next line") {
+		t.Fatal("discarding an oversized line also discarded subsequent lines")
 	}
 }

@@ -2,6 +2,8 @@ package deploy
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/vicape92/repodeploy/internal/upload"
@@ -54,4 +56,29 @@ func (s *Store) pruneUploads(projectID string) error {
 		return err
 	}
 	return s.Uploads.Prune(projectID, keep, uploadGrace)
+}
+
+var ErrUploadStorage = errors.New("cannot store upload")
+
+func (s *Store) EnqueueUpload(id, archive string, limits upload.Limits, force bool) (j Job, unchanged bool, err error) {
+	err = s.WithProject(id, func(p Project) error {
+		if !p.IsUpload() {
+			return errors.New("this project deploys from Git; create an upload project for manual uploads")
+		}
+		hash, err := s.Uploads.Save(id, archive, limits)
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrUploadStorage, err)
+		}
+		if !force && p.Active != "" {
+			active, e := s.Job(p.Active)
+			if e == nil && active.Commit == hash {
+				j = active
+				unchanged = true
+				return nil
+			}
+		}
+		j, err = s.enqueue(id, "upload", "", hash, "")
+		return err
+	})
+	return
 }

@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -91,7 +93,30 @@ func newPasswordCredentials(password, tokenHashValue string) credentials {
 func credentialsPath(root string) string { return filepath.Join(root, "admin.json") }
 func tokenPath(root string) string       { return filepath.Join(root, "admin.token") }
 
+func lockCredentials(root string) (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(root, "credentials.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func unlockCredentials(f *os.File) { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }
+
 func loadCredentials(root string) (credentials, error) {
+	f, err := lockCredentials(root)
+	if err != nil {
+		return credentials{}, err
+	}
+	defer unlockCredentials(f)
+	return readCredentials(root)
+}
+
+func readCredentials(root string) (credentials, error) {
 	b, err := os.ReadFile(credentialsPath(root))
 	if err != nil {
 		return credentials{}, errors.New("initialize administrator credentials before serving")
@@ -100,6 +125,11 @@ func loadCredentials(root string) (credentials, error) {
 	if err = json.Unmarshal(b, &c); err != nil || c.Salt == "" || c.Password == "" || c.TokenHash == "" || (c.KDF != nil && !c.KDF.valid()) {
 		return credentials{}, errors.New("invalid administrator credentials")
 	}
+	token, err := os.ReadFile(tokenPath(root))
+	if err != nil || strings.TrimSpace(string(token)) == "" {
+		return credentials{}, errors.New("invalid administrator token")
+	}
+	c.TokenHash = tokenHash(strings.TrimSpace(string(token)))
 	return c, nil
 }
 
@@ -155,6 +185,11 @@ func Initialize(root, password string) error {
 	if err := os.Chmod(root, 0700); err != nil {
 		return err
 	}
+	lock, err := lockCredentials(root)
+	if err != nil {
+		return err
+	}
+	defer unlockCredentials(lock)
 	token := randomToken()
 	b, err := json.Marshal(newPasswordCredentials(password, tokenHash(token)))
 	if err != nil {
@@ -192,7 +227,12 @@ func ChangePassword(root, password string) error {
 	if err := validatePassword(password); err != nil {
 		return err
 	}
-	c, err := loadCredentials(root)
+	f, err := lockCredentials(root)
+	if err != nil {
+		return err
+	}
+	defer unlockCredentials(f)
+	c, err := readCredentials(root)
 	if err != nil {
 		return err
 	}
@@ -205,7 +245,12 @@ func ChangePassword(root, password string) error {
 // RotateToken issues a new CLI token, stores it in admin.token and revokes the
 // previous one. Browser sessions are unaffected.
 func RotateToken(root string) (string, error) {
-	c, err := loadCredentials(root)
+	f, err := lockCredentials(root)
+	if err != nil {
+		return "", err
+	}
+	defer unlockCredentials(f)
+	c, err := readCredentials(root)
 	if err != nil {
 		return "", err
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -140,5 +141,44 @@ func TestLogWriterRedactsEachLineOfMultiLineValues(t *testing.T) {
 	}
 	if !strings.Contains(logs, "[REDACTED]") {
 		t.Fatalf("nothing redacted: %q", logs)
+	}
+}
+
+type auditLoggingRuntime struct{ *testRuntime }
+
+func (r auditLoggingRuntime) Build(ctx context.Context, p Project, source, dir string, log io.Writer) (string, error) {
+	for _, v := range p.Env {
+		io.WriteString(log, v.Value+"\n")
+	}
+	return r.testRuntime.Build(ctx, p, source, dir, log)
+}
+
+func TestEnvironmentUpdatedDuringPreparationIsRedacted(t *testing.T) {
+	e, r, p, _ := engineFixture(t)
+	e.Runtime = auditLoggingRuntime{r}
+	if _, err := e.Store.Enqueue(p.ID, "manual", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	j, err := e.Store.Claim()
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := e.Store.LogWriter(j.ID)
+	const secret = "new-secret-changed-during-preparation"
+	if err := e.Store.Env.Set(p.ID, []envvars.Update{{Name: "API_KEY", Value: secret}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.execute(context.Background(), &j, log); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	text, err := e.Store.Logs(j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(text, secret) {
+		t.Fatal("environment value used by the build was saved in plaintext in deployment logs")
 	}
 }

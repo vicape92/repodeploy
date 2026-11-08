@@ -80,10 +80,10 @@ func (s *Store) SaveSecret(projectID, name string, value []byte) error {
 	if !ValidSecretName(name) {
 		return errors.New("invalid secret name; use letters, digits, '_' or '-' (max 100)")
 	}
-	if len(value) == 0 {
+	if len(value) == 0 || len(value) > 1<<20 {
 		return errors.New("secret must contain 1–1048576 bytes")
 	}
-	return WritePrivate(s.secretPath(projectID, name), value)
+	return s.WithProject(projectID, func(Project) error { return WritePrivate(s.secretPath(projectID, name), value) })
 }
 
 // DeleteSecret removes a stored value. Retained releases keep their snapshot.
@@ -91,13 +91,15 @@ func (s *Store) DeleteSecret(projectID, name string) error {
 	if !ValidSecretName(name) {
 		return errors.New("invalid secret name")
 	}
-	if err := os.Remove(s.secretPath(projectID, name)); err != nil {
-		if os.IsNotExist(err) {
-			return errors.New("secret not found")
+	return s.WithProject(projectID, func(Project) error {
+		if err := os.Remove(s.secretPath(projectID, name)); err != nil {
+			if os.IsNotExist(err) {
+				return errors.New("secret not found")
+			}
+			return err
 		}
-		return err
-	}
-	return nil
+		return nil
+	})
 }
 
 // WritePrivate replaces path atomically with a 0600 file.
@@ -137,4 +139,13 @@ func (s *Store) LatestJobs() (map[string]Job, error) {
 		out[j.ProjectID] = j
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) SaveWebhookSecret(id string, value []byte) error {
+	return s.WithProject(id, func(p Project) error {
+		if p.IsUpload() {
+			return errors.New("upload projects have no webhook")
+		}
+		return WritePrivate(filepath.Join(s.Root, "secrets", id+".webhook"), value)
+	})
 }

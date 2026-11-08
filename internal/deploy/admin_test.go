@@ -7,11 +7,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"github.com/vicape92/repodeploy/internal/envvars"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type purgeRuntime struct {
@@ -184,4 +187,131 @@ func keys(m map[string][]byte) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+type backupSnapshotGate struct {
+	started, release chan struct{}
+	once             sync.Once
+	bytes.Buffer
+}
+
+func (w *backupSnapshotGate) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.started); <-w.release })
+	return w.Buffer.Write(p)
+}
+func TestBackupPinsReferencedArtifactsUntilCopyCompletes(t *testing.T) {
+	e, _, p, _ := engineFixture(t)
+	e.Runtime = &purgeRuntime{testRuntime: &testRuntime{}}
+	j := runDeployment(t, e, p)
+	output := &backupSnapshotGate{started: make(chan struct{}), release: make(chan struct{})}
+	copied := make(chan error, 1)
+	go func() { copied <- Backup(e.Store.Root, output) }()
+	<-output.started
+	deleted := make(chan error, 1)
+	go func() { deleted <- e.DeleteProject(context.Background(), p.ID, false) }()
+	removed := false
+	select {
+	case err := <-deleted:
+		removed = true
+		if err != nil {
+			t.Error(err)
+		}
+		t.Error("deletion removed artifacts while their backup snapshot was pinned")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(output.release)
+	if err := <-copied; err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		if err := <-deleted; err != nil {
+			t.Fatal(err)
+		}
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(output.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	manifest, _ := filepath.Rel(e.Store.Root, j.Manifest)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.Name == filepath.ToSlash(manifest) {
+			return
+		}
+	}
+	t.Fatal("successful backup omitted its database snapshot's active manifest")
+}
+func TestDeletedProjectCannotBeResurrectedOrReceiveSecrets(t *testing.T) {
+	e, _, p, _ := engineFixture(t)
+	e.Runtime = &purgeRuntime{testRuntime: &testRuntime{}}
+	if _, err := e.Store.Enqueue(p.ID, "github", "audit-delivery", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DeleteProject(context.Background(), p.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	var deliveries int
+	if err := e.Store.db.QueryRow("SELECT COUNT(*) FROM deliveries WHERE project_id=?", p.ID).Scan(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if deliveries != 0 {
+		t.Error("deleted project's delivery tombstones were retained")
+	}
+	if err := e.Store.SetEnv(p.ID, []envvars.Update{{Name: "TOKEN", Value: "secret-value"}}); err == nil {
+		t.Error("variables written for deleted project")
+	}
+	if err := e.Store.SaveSecret(p.ID, "password", []byte("secret-value")); err == nil {
+		t.Error("secret written for deleted project")
+	}
+	if _, err := e.Store.SaveProject(p); err == nil {
+		t.Error("update resurrected deleted project")
+	}
+}
+func TestSecretSizeLimitAppliesToStore(t *testing.T) {
+	s := testStore(t)
+	p := testProject(t, s)
+	if err := s.SaveSecret(p.ID, "large", make([]byte, (1<<20)+1)); err == nil {
+		t.Fatal("oversized secret accepted")
+	}
+}
+
+func TestBackupExcludesConcurrentSecretDeletion(t *testing.T) {
+	s := testStore(t)
+	p := testProject(t, s)
+	if err := s.SaveSecret(p.ID, "password", []byte("old-secret")); err != nil {
+		t.Fatal(err)
+	}
+	output := &backupSnapshotGate{started: make(chan struct{}), release: make(chan struct{})}
+	copied := make(chan error, 1)
+	go func() { copied <- Backup(s.Root, output) }()
+	<-output.started
+	deleted := make(chan error, 1)
+	go func() { deleted <- s.DeleteSecret(p.ID, "password") }()
+	finished := false
+	select {
+	case err := <-deleted:
+		finished = true
+		if err != nil {
+			t.Error(err)
+		}
+		t.Error("secret mutation was not excluded from the backup snapshot")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(output.release)
+	if err := <-copied; err != nil {
+		t.Fatal(err)
+	}
+	if !finished {
+		if err := <-deleted; err != nil {
+			t.Fatal(err)
+		}
+	}
 }

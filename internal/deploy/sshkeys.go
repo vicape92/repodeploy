@@ -2,7 +2,9 @@ package deploy
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -47,6 +49,11 @@ func (s *Store) PruneSSHKeys(maxAge time.Duration, now time.Time) (int, error) {
 	if s.Sources == nil {
 		return 0, nil
 	}
+	release, err := lockFile(s.Root, "artifacts.lock", false)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	keys, err := s.Sources.SSHKeys()
 	if err != nil {
 		return 0, err
@@ -67,4 +74,24 @@ func (s *Store) PruneSSHKeys(maxAge time.Duration, now time.Time) (int, error) {
 		removed++
 	}
 	return removed, nil
+}
+
+func (s *Store) DeleteSSHKey(id string) error {
+	release, err := lockFile(s.Root, "artifacts.lock", false)
+	if err != nil {
+		return err
+	}
+	defer release()
+	key, err := s.Sources.SSHKey(id)
+	if err != nil {
+		return err
+	}
+	usage, err := s.SSHKeyUsage()
+	if err != nil {
+		return err
+	}
+	if users := usage[filepath.Clean(key.PrivatePath)]; len(users) > 0 {
+		return fmt.Errorf("this key is still used by %s; switch those projects to another key or delete them first", strings.Join(users, ", "))
+	}
+	return s.Sources.DeleteSSH(id)
 }

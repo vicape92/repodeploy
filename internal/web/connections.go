@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -127,19 +126,11 @@ func (s *Server) connections(w http.ResponseWriter, r *http.Request) {
 
 // sshDelete removes a generated key that no project or pending deployment uses.
 func (s *Server) sshDelete(w http.ResponseWriter, r *http.Request) {
-	key, err := s.Store.Sources.SSHKey(r.PathValue("id"))
-	if err != nil {
+	if _, err := s.Store.Sources.SSHKey(r.PathValue("id")); err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	usage, err := s.Store.SSHKeyUsage()
-	if err == nil {
-		if users := usage[filepath.Clean(key.PrivatePath)]; len(users) > 0 {
-			err = fmt.Errorf("this key is still used by %s; switch those projects to another key or delete them first", strings.Join(users, ", "))
-		} else {
-			err = s.Store.Sources.DeleteSSH(key.ID)
-		}
-	}
+	err := s.Store.DeleteSSHKey(r.PathValue("id"))
 	if err != nil {
 		p, status, pageErr := s.connectionsPage(r)
 		if pageErr != nil {

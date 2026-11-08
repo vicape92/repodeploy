@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -89,12 +90,78 @@ type Job struct {
 func (p Project) IsUpload() bool { return p.Source == "upload" }
 
 type Store struct {
-	Root    string
-	Sources *scm.Manager
-	Env     *envvars.Store
-	Uploads *upload.Store
-	db      *sql.DB
-	logMu   sync.Mutex
+	Root            string
+	Sources         *scm.Manager
+	Env             *envvars.Store
+	Uploads         *upload.Store
+	db              *sql.DB
+	projectRevision atomic.Uint64
+	projectMu       sync.Mutex
+	projectLocks    map[string]*projectLock
+}
+
+type projectLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (s *Store) lockProject(id string) func() {
+	s.projectMu.Lock()
+	if s.projectLocks == nil {
+		s.projectLocks = make(map[string]*projectLock)
+	}
+	l := s.projectLocks[id]
+	if l == nil {
+		l = &projectLock{}
+		s.projectLocks[id] = l
+	}
+	l.refs++
+	s.projectMu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		s.projectMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(s.projectLocks, id)
+		}
+		s.projectMu.Unlock()
+	}
+}
+
+func lockFile(root, name string, shared bool) (func(), error) {
+	f, err := os.OpenFile(filepath.Join(root, name), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err = f.Chmod(0600); err != nil {
+		f.Close()
+		return nil, err
+	}
+	mode := syscall.LOCK_EX
+	if shared {
+		mode = syscall.LOCK_SH
+	}
+	if err = syscall.Flock(int(f.Fd()), mode); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+}
+
+func (s *Store) WithProject(id string, fn func(Project) error) error {
+	unlock := s.lockProject(id)
+	defer unlock()
+	release, err := lockFile(s.Root, "artifacts.lock", true)
+	if err != nil {
+		return err
+	}
+	defer release()
+	p, err := s.Project(id)
+	if err != nil {
+		return err
+	}
+	return fn(p)
 }
 
 func newID() string {
@@ -144,6 +211,10 @@ func OpenStore(root string) (*Store, error) {
  CREATE TABLE IF NOT EXISTS jobs(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,project_id TEXT NOT NULL REFERENCES projects(id),snapshot TEXT NOT NULL,source TEXT NOT NULL,sha TEXT NOT NULL DEFAULT '',rollback TEXT NOT NULL DEFAULT '',phase TEXT NOT NULL DEFAULT 'queued',created TEXT NOT NULL,started TEXT NOT NULL DEFAULT '',finished TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',recovery TEXT NOT NULL DEFAULT '',manifest TEXT NOT NULL DEFAULT '',previous TEXT NOT NULL DEFAULT '',retained INTEGER NOT NULL DEFAULT 1);
  CREATE TABLE IF NOT EXISTS deliveries(project_id TEXT NOT NULL,key TEXT NOT NULL,job TEXT NOT NULL,PRIMARY KEY(project_id,key));
  CREATE TABLE IF NOT EXISTS observed(project_id TEXT NOT NULL,sha TEXT NOT NULL,job TEXT NOT NULL,PRIMARY KEY(project_id,sha));
+ CREATE INDEX IF NOT EXISTS jobs_phase_seq ON jobs(phase,seq);
+ CREATE INDEX IF NOT EXISTS jobs_inflight_seq ON jobs(phase,seq) WHERE phase NOT IN ('queued','waiting_ci','succeeded','failed');
+ CREATE INDEX IF NOT EXISTS jobs_project_retained_seq ON jobs(project_id,retained,seq);
+ CREATE INDEX IF NOT EXISTS jobs_retained_project_seq ON jobs(project_id,seq) WHERE retained=1;
  PRAGMA user_version=1;`)
 	if err != nil {
 		db.Close()
@@ -174,15 +245,31 @@ func Lock(root string) (func(), error) {
 }
 
 func (s *Store) SaveProject(p Project) (Project, error) {
+	creating := p.ID == ""
+	if creating {
+		p.ID = newID()
+	}
+	unlock := s.lockProject(p.ID)
+	defer unlock()
+	release, err := lockFile(s.Root, "artifacts.lock", true)
+	if err != nil {
+		return p, err
+	}
+	defer release()
+	if !creating {
+		if _, err = s.Project(p.ID); err != nil {
+			return p, err
+		}
+	}
+	if err = validateSSHFiles(p); err != nil {
+		return p, err
+	}
 	p.EnvDigest, p.Env = "", nil
 	if p.IsUpload() {
 		p.Mode = "manual"
 	}
 	if p.CITimeout == 0 {
 		p.CITimeout = 1800
-	}
-	if p.ID == "" {
-		p.ID = newID()
 	}
 	if p.HealthTimeout == 0 {
 		p.HealthTimeout = 60
@@ -197,10 +284,23 @@ func (s *Store) SaveProject(p Project) (Project, error) {
 	if err != nil {
 		return p, err
 	}
-	_, err = s.db.Exec(`INSERT INTO projects(id,config) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET config=excluded.config`, p.ID, string(b))
+	if creating {
+		_, err = s.db.Exec(`INSERT INTO projects(id,config) VALUES(?,?)`, p.ID, string(b))
+	} else {
+		var result sql.Result
+		result, err = s.db.Exec(`UPDATE projects SET config=? WHERE id=?`, string(b), p.ID)
+		if err == nil {
+			var n int64
+			n, err = result.RowsAffected()
+			if err == nil && n == 0 {
+				err = sql.ErrNoRows
+			}
+		}
+	}
 	if err != nil {
 		return p, err
 	}
+	s.projectRevision.Add(1)
 	return s.Project(p.ID)
 }
 
@@ -269,7 +369,12 @@ func (s *Store) Jobs(project string) ([]Job, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) Enqueue(project, source, event, sha, rollback string) (Job, error) {
+func (s *Store) Enqueue(project, source, event, sha, rollback string) (j Job, err error) {
+	err = s.WithProject(project, func(Project) error { j, err = s.enqueue(project, source, event, sha, rollback); return err })
+	return
+}
+
+func (s *Store) enqueue(project, source, event, sha, rollback string) (Job, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Job{}, err
@@ -278,6 +383,15 @@ func (s *Store) Enqueue(project, source, event, sha, rollback string) (Job, erro
 	p, err := scanProject(tx.QueryRow(`SELECT config,active,paused,blocked,poll_error FROM projects WHERE id=?`, project))
 	if err != nil {
 		return Job{}, err
+	}
+	if rollback != "" {
+		var valid int
+		if err = tx.QueryRow(`SELECT COUNT(*) FROM jobs WHERE id=? AND project_id=? AND retained=1 AND phase='succeeded'`, rollback, project).Scan(&valid); err != nil {
+			return Job{}, err
+		}
+		if valid == 0 {
+			return Job{}, errors.New("rollback release is unavailable")
+		}
 	}
 	var existing string
 	if event != "" {
@@ -383,10 +497,17 @@ func (s *Store) Pause(project string, blocked bool) error {
 	if _, err = tx.Exec(`UPDATE jobs SET phase='failed',error='automation paused',finished=? WHERE project_id=? AND ((source NOT IN ('manual','upload') AND phase='queued') OR phase='waiting_ci')`, now(), project); err != nil {
 		return err
 	}
-	return tx.Commit()
+	err = tx.Commit()
+	if err == nil {
+		s.projectRevision.Add(1)
+	}
+	return err
 }
 func (s *Store) Resume(project string) error {
 	_, err := s.db.Exec(`UPDATE projects SET paused=0 WHERE id=? AND blocked=0`, project)
+	if err == nil {
+		s.projectRevision.Add(1)
+	}
 	return err
 }
 func (s *Store) PollError(project, message string) error {
@@ -408,4 +529,21 @@ func (s *Store) Interrupted() ([]Job, error) {
 		out = append(out, j)
 	}
 	return out, rows.Err()
+}
+
+var ErrSourceChanged = errors.New("project source changed during detection")
+
+func (s *Store) EnqueueObserved(observed Project, source, event, sha string) (j Job, err error) {
+	err = s.WithProject(observed.ID, func(current Project) error {
+		if !sameSource(current, observed) {
+			return ErrSourceChanged
+		}
+		j, err = s.enqueue(current.ID, source, event, sha, "")
+		return err
+	})
+	return
+}
+
+func sameSource(a, b Project) bool {
+	return a.Source == b.Source && a.Repo == b.Repo && a.Branch == b.Branch && a.Connection == b.Connection && a.RepositoryID == b.RepositoryID && a.SSHKey == b.SSHKey && a.KnownHosts == b.KnownHosts && a.Mode == b.Mode
 }

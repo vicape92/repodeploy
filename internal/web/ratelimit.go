@@ -1,6 +1,7 @@
 package web
 
 import (
+	"container/list"
 	"net"
 	"net/http"
 	"net/url"
@@ -11,9 +12,8 @@ import (
 
 const (
 	loginWindow        = time.Minute
-	loginPerIPWindow   = 5  // attempts per client per window
-	loginGlobalWindow  = 30 // attempts across all clients per window
-	loginLockThreshold = 5  // consecutive failures before an escalating lockout
+	loginPerIPWindow   = 5 // attempts per client per window
+	loginLockThreshold = 5 // consecutive failures before an escalating lockout
 	loginMaxLock       = 15 * time.Minute
 	loginMaxClients    = 10000
 )
@@ -22,16 +22,14 @@ type clientAttempts struct {
 	recent      []time.Time
 	failures    int
 	lockedUntil time.Time
-	last        time.Time
+	element     *list.Element
 }
 
-// loginLimiter throttles password attempts per client address, with a higher
-// global ceiling against distributed guessing. A single client can no longer
-// lock every other client out, which the previous global limit allowed.
+// loginLimiter throttles password attempts per client or IPv6 subnet.
 type loginLimiter struct {
 	mu      sync.Mutex
 	clients map[string]*clientAttempts
-	global  []time.Time
+	lru     list.List
 	now     func() time.Time
 }
 
@@ -56,23 +54,20 @@ func (l *loginLimiter) allow(client string) (time.Duration, bool) {
 	defer l.mu.Unlock()
 	now := l.now()
 	cutoff := now.Add(-loginWindow)
-	l.global = recentSince(l.global, cutoff)
-	if len(l.clients) >= loginMaxClients {
-		for key, c := range l.clients {
-			if c.last.Before(now.Add(-loginMaxLock)) && now.After(c.lockedUntil) {
-				delete(l.clients, key)
-			}
-		}
-	}
+	client = subnetClient(client)
 	c := l.clients[client]
 	if c == nil {
 		if len(l.clients) >= loginMaxClients {
-			return loginWindow, false
+			oldest := l.lru.Back()
+			delete(l.clients, oldest.Value.(string))
+			l.lru.Remove(oldest)
 		}
 		c = &clientAttempts{}
+		c.element = l.lru.PushFront(client)
 		l.clients[client] = c
+	} else {
+		l.lru.MoveToFront(c.element)
 	}
-	c.last = now
 	if now.Before(c.lockedUntil) {
 		return c.lockedUntil.Sub(now), false
 	}
@@ -80,11 +75,7 @@ func (l *loginLimiter) allow(client string) (time.Duration, bool) {
 	if len(c.recent) >= loginPerIPWindow {
 		return c.recent[0].Add(loginWindow).Sub(now), false
 	}
-	if len(l.global) >= loginGlobalWindow {
-		return l.global[0].Add(loginWindow).Sub(now), false
-	}
 	c.recent = append(c.recent, now)
-	l.global = append(l.global, now)
 	return 0, true
 }
 
@@ -92,7 +83,11 @@ func (l *loginLimiter) allow(client string) (time.Duration, bool) {
 func (l *loginLimiter) result(client string, success bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	client = subnetClient(client)
 	if success {
+		if c := l.clients[client]; c != nil {
+			l.lru.Remove(c.element)
+		}
 		delete(l.clients, client)
 		return
 	}
@@ -105,6 +100,14 @@ func (l *loginLimiter) result(client string, success bool) {
 		lock := loginWindow << min(c.failures-loginLockThreshold, 4)
 		c.lockedUntil = l.now().Add(min(lock, loginMaxLock))
 	}
+}
+
+func subnetClient(client string) string {
+	ip := net.ParseIP(client)
+	if ip == nil || ip.To4() != nil {
+		return client
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 // clientIP returns the address used for throttling. Forwarding headers are

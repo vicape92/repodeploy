@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -188,5 +189,66 @@ func TestShutdownDuringCIRequestPreservesWaitingJob(t *testing.T) {
 	job, _ := e.Store.Job(waiting.ID)
 	if !errors.Is(err, context.Canceled) || job.Phase != "waiting_ci" {
 		t.Fatalf("shutdown failed waiting job: %+v %v", job, err)
+	}
+}
+
+type blockingCITransport struct {
+	base             http.RoundTripper
+	started, release chan struct{}
+	once             sync.Once
+}
+
+func (b *blockingCITransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(r.URL.Path, "/statuses") {
+		b.once.Do(func() { close(b.started) })
+		select {
+		case <-b.release:
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	}
+	return b.base.RoundTrip(r)
+}
+func TestSlowCIRecheckDoesNotBlockWorker(t *testing.T) {
+	e, _, p, _ := ciFixture(t)
+	waiting := runDeployment(t, e, p)
+	if waiting.Phase != "waiting_ci" {
+		t.Fatal(waiting.Phase)
+	}
+	e.ciChecks = nil
+	transport := &blockingCITransport{base: e.Store.Sources.Client.Transport, started: make(chan struct{}), release: make(chan struct{})}
+	e.Store.Sources.Client.Transport = transport
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	defer func() { close(transport.release); cancel(); <-done }()
+	select {
+	case <-transport.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CI check not started")
+	}
+	other := testProject(t, e.Store)
+	other.Repo = p.Repo
+	other, err := e.Store.SaveProject(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := e.Store.Enqueue(other.ID, "manual", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got, err := e.Store.Job(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Phase == "succeeded" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("blocked CI stalled another project: %s", got.Phase)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

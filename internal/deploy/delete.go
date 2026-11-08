@@ -28,6 +28,8 @@ func (e *Engine) DeleteProject(ctx context.Context, id string, volumes bool) err
 		return ErrBusy
 	}
 	defer e.mu.Unlock()
+	unlock := e.Store.lockProject(id)
+	defer unlock()
 	p, err := e.Store.Project(id)
 	if err != nil {
 		return errors.New("project not found")
@@ -50,11 +52,21 @@ func (e *Engine) DeleteProject(ctx context.Context, id string, volumes bool) err
 	if err != nil {
 		return err
 	}
+	release, err := lockFile(e.Store.Root, "artifacts.lock", false)
+	if err != nil {
+		return err
+	}
+	defer release()
 	for _, jobID := range ids {
 		dir := filepath.Join(e.Store.Root, "releases", jobID)
 		if err = e.Runtime.Forget(ctx, p, dir, io.Discard); err != nil {
 			return fmt.Errorf("cannot remove built image for release %s: %w", jobID, err)
 		}
+	}
+
+	for _, jobID := range ids {
+		dir := filepath.Join(e.Store.Root, "releases", jobID)
+
 		if err = os.RemoveAll(dir); err != nil {
 			return err
 		}
@@ -114,7 +126,11 @@ func (s *Store) deleteProjectRows(project string) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	err = tx.Commit()
+	if err == nil {
+		s.projectRevision.Add(1)
+	}
+	return err
 }
 
 // Purge stops the project's Compose application and removes leftovers that

@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,14 +24,34 @@ import (
 
 type multipartKey struct{}
 
+type deadlineBody struct {
+	io.ReadCloser
+	clear func()
+	once  sync.Once
+}
+
+func (b *deadlineBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.once.Do(b.clear)
+	}
+	return n, err
+}
+
+func (b *deadlineBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.clear)
+	return err
+}
+
 type session struct {
 	CSRF    string
+	Epoch   string
 	Expires time.Time
 }
 type Server struct {
 	Store    *deploy.Store
 	auth     credentials
-	credInfo os.FileInfo
 	secure   bool
 	mu       sync.Mutex
 	sessions map[string]session
@@ -38,6 +59,7 @@ type Server struct {
 	// webhookSlots bounds concurrent webhook bodies held in memory.
 	webhookSlots chan struct{}
 	loginSlots   chan struct{}
+	loginQueue   chan struct{}
 	BaseURL      string
 	flows        map[string]connectionFlow
 	// TrustProxy honours X-Forwarded-For/X-Real-IP from a loopback reverse
@@ -56,40 +78,31 @@ type Server struct {
 }
 
 func New(s *deploy.Store, secure bool) (*Server, error) {
-	info, err := os.Stat(credentialsPath(s.Root))
-	if err != nil {
-		return nil, errors.New("initialize administrator credentials before serving")
-	}
 	c, err := loadCredentials(s.Root)
 	if err != nil {
 		return nil, err
 	}
-	return &Server{Store: s, auth: c, credInfo: info, secure: secure, sessions: make(map[string]session), limiter: newLoginLimiter(), webhookSlots: make(chan struct{}, 4), loginSlots: make(chan struct{}, 2), uploadSlots: make(chan struct{}, 2), flows: make(map[string]connectionFlow)}, nil
+	return &Server{Store: s, auth: c, secure: secure, sessions: make(map[string]session), limiter: newLoginLimiter(), webhookSlots: make(chan struct{}, 4), loginSlots: make(chan struct{}, 2), loginQueue: make(chan struct{}, 16), uploadSlots: make(chan struct{}, 2), flows: make(map[string]connectionFlow)}, nil
 }
 
-// credentials returns the administrator credentials, reloading admin.json when
-// another process (repodeploy passwd / rotate-token) replaced it. Every write
-// is an atomic rename, so a changed inode, size or mtime marks a new version.
-// A new epoch signs out all browser sessions. Failures are fatal for auth.
+// credentials reloads both credential files and revokes sessions on epoch changes.
 func (s *Server) credentials() (credentials, error) {
-	info, err := os.Stat(credentialsPath(s.Store.Root))
-	if err != nil {
-		return credentials{}, errors.New("administrator credentials unavailable")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.credInfo != nil && os.SameFile(info, s.credInfo) && info.Size() == s.credInfo.Size() && info.ModTime().Equal(s.credInfo.ModTime()) {
-		return s.auth, nil
-	}
-	c, err := loadCredentials(s.Store.Root)
+	f, err := lockCredentials(s.Store.Root)
 	if err != nil {
 		return credentials{}, err
 	}
+	defer unlockCredentials(f)
+	c, err := readCredentials(s.Store.Root)
+	if err != nil {
+		return credentials{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if c.Epoch != s.auth.Epoch {
 		s.sessions = make(map[string]session)
 		s.flows = make(map[string]connectionFlow)
 	}
-	s.auth, s.credInfo = c, info
+	s.auth = c
 	return c, nil
 }
 
@@ -179,6 +192,20 @@ func (s *Server) Handler() http.Handler {
 			// Room for the archive plus multipart framing.
 			limit = s.maxUpload() + maxRequestBody
 		}
+		deadline := 10 * time.Second
+		if strings.HasPrefix(r.URL.Path, "/hooks/github/") {
+			deadline = 30 * time.Second
+		}
+		if r.Method == http.MethodPost && isUploadPath(r.URL.Path) {
+			deadline = 10 * time.Minute
+		}
+		if r.Body != nil && r.Body != http.NoBody {
+			controller := http.NewResponseController(w)
+			_ = controller.SetReadDeadline(time.Now().Add(deadline))
+			body := &deadlineBody{ReadCloser: r.Body, clear: func() { _ = controller.SetReadDeadline(time.Time{}) }}
+			r.Body = body
+			defer body.once.Do(body.clear)
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		if r.URL.Path == "/login" || strings.HasPrefix(r.URL.Path, "/hooks/github/") || (r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/static/")) || (r.Method == "GET" && (r.URL.Path == "/connections/github/callback" || r.URL.Path == "/connections/bitbucket/callback")) {
 			mux.ServeHTTP(w, r)
@@ -197,7 +224,7 @@ func (s *Server) Handler() http.Handler {
 			s.mu.Lock()
 			sess, ok = s.sessions[cookie.Value]
 			s.mu.Unlock()
-			ok = ok && time.Now().Before(sess.Expires)
+			ok = ok && sess.Epoch == auth.Epoch && time.Now().Before(sess.Expires)
 		}
 		if !tokenOK && !ok {
 			if strings.HasPrefix(r.URL.Path, "/api/") {
@@ -257,6 +284,7 @@ func (s *Server) Handler() http.Handler {
 			}
 		}
 		if ok {
+			r = r.WithContext(context.WithValue(r.Context(), sessionEpochKey{}, sess.Epoch))
 			r = r.WithContext(context.WithValue(r.Context(), csrfKey{}, sess.CSRF))
 			cookie, _ := r.Cookie(s.sessionCookie())
 			r = r.WithContext(context.WithValue(r.Context(), sessionIDKey{}, cookie.Value))
@@ -266,6 +294,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 type csrfKey struct{}
+type sessionEpochKey struct{}
 
 const (
 	maxRequestBody = 1 << 20
@@ -304,6 +333,19 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	fail := func(status int, message string) {
 		s.renderStatus(w, r, status, page{View: "login", Error: message})
 	}
+	if err := r.ParseForm(); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		fail(400, "Invalid sign-in form.")
+		return
+	}
+	if len(r.Form.Get("password")) > 1024 || r.Form.Get("password") == "" {
+		fail(400, "Invalid sign-in form.")
+		return
+	}
 	auth, err := s.credentials()
 	if err != nil {
 		fail(500, "Administrator credentials are unavailable. Check the state directory on the host.")
@@ -332,14 +374,26 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		s.upgradeHash(auth, password)
 	}
 	token := randomToken()
+	f, err := lockCredentials(s.Store.Root)
+	if err != nil {
+		fail(500, "Administrator credentials are unavailable.")
+		return
+	}
+	current, err := readCredentials(s.Store.Root)
+	if err != nil || current.Epoch != auth.Epoch || current.Password != auth.Password && !auth.needsRehash() {
+		unlockCredentials(f)
+		fail(401, "Incorrect password.")
+		return
+	}
 	s.mu.Lock()
 	for key, sess := range s.sessions {
 		if time.Now().After(sess.Expires) {
 			delete(s.sessions, key)
 		}
 	}
-	s.sessions[token] = session{CSRF: randomToken(), Expires: time.Now().Add(8 * time.Hour)}
+	s.sessions[token] = session{CSRF: randomToken(), Epoch: current.Epoch, Expires: time.Now().Add(8 * time.Hour)}
 	s.mu.Unlock()
+	unlockCredentials(f)
 	http.SetCookie(w, &http.Cookie{Name: s.sessionCookie(), Value: token, Path: "/", HttpOnly: true, Secure: s.secure, SameSite: http.SameSiteStrictMode, MaxAge: 8 * 3600})
 	http.Redirect(w, r, "/", 303)
 }
@@ -347,6 +401,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 // acquireLoginSlot bounds concurrent Argon2 work (64 MiB each), waiting briefly
 // instead of failing immediately when another verification is in progress.
 func (s *Server) acquireLoginSlot(r *http.Request) bool {
+	select {
+	case s.loginQueue <- struct{}{}:
+		defer func() { <-s.loginQueue }()
+	default:
+		return false
+	}
 	timer := time.NewTimer(3 * time.Second)
 	defer timer.Stop()
 	select {
@@ -363,8 +423,13 @@ func (s *Server) acquireLoginSlot(r *http.Request) bool {
 // successful sign-in. It keeps the epoch, so sessions survive, and aborts if
 // the credentials changed since they were verified.
 func (s *Server) upgradeHash(verified credentials, password string) {
-	current, err := loadCredentials(s.Store.Root)
-	if err != nil || current.Salt != verified.Salt || current.Password != verified.Password {
+	f, err := lockCredentials(s.Store.Root)
+	if err != nil {
+		return
+	}
+	defer unlockCredentials(f)
+	current, err := readCredentials(s.Store.Root)
+	if err != nil || current.Epoch != verified.Epoch || current.Salt != verified.Salt || current.Password != verified.Password {
 		return
 	}
 	kdf := currentKDF
@@ -641,12 +706,13 @@ func (s *Server) job(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, err := s.Store.Job(id); err != nil {
+	j, err := s.Store.Job(id)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	if r.URL.Query().Get("follow") != "1" {
-		log, err := s.Store.Logs(id)
+		log, _, err := s.Store.ReadLogs(id, 0)
 		if err != nil {
 			http.Error(w, "cannot read logs", 500)
 			return
@@ -662,28 +728,38 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
-	offset := 0
+	controller := http.NewResponseController(w)
+	defer controller.SetWriteDeadline(time.Time{})
+	var offset int64
+	phase := ""
+	last := time.Now()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		log, err := s.Store.Logs(id)
+		log, next, err := s.Store.ReadLogs(id, offset)
 		if err != nil {
 			return
 		}
-		j, err := s.Store.Job(id)
-		if err != nil {
-			return
+		offset = next
+		if log != "" || phase != j.Phase {
+			b, _ := json.Marshal(map[string]string{"log": log, "phase": j.Phase})
+			controller.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if _, err = fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+				return
+			}
+			f.Flush()
+			last = time.Now()
+			phase = j.Phase
+		} else if time.Since(last) >= 15*time.Second {
+			controller.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if _, err = fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			f.Flush()
+			last = time.Now()
 		}
-		if offset > len(log) {
-			offset = 0
-		}
-		b, _ := json.Marshal(map[string]string{"log": log[offset:], "phase": j.Phase})
-		offset = len(log)
-		if _, err = fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
-			return
-		}
-		f.Flush()
 		if j.Phase == "succeeded" || j.Phase == "failed" {
+			controller.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			fmt.Fprint(w, "event: done\ndata: {}\n\n")
 			f.Flush()
 			return
@@ -692,6 +768,10 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
+		}
+		j, err = s.Store.Job(id)
+		if err != nil {
+			return
 		}
 	}
 }
@@ -723,7 +803,7 @@ func (s *Server) webhookSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	secret := randomToken()
-	if err = deploy.WritePrivate(filepath.Join(s.Store.Root, "secrets", p.ID+".webhook"), []byte(secret)); err != nil {
+	if err = s.Store.SaveWebhookSecret(p.ID, []byte(secret)); err != nil {
 		http.Error(w, "cannot rotate webhook secret", 500)
 		return
 	}
@@ -734,6 +814,15 @@ func (s *Server) webhookSecret(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
+	signature := r.Header.Get("X-Hub-Signature-256")
+	if !strings.HasPrefix(signature, "sha256=") || len(signature) != 71 {
+		http.Error(w, "invalid signature", 403)
+		return
+	}
+	if _, err := hex.DecodeString(signature[7:]); err != nil {
+		http.Error(w, "invalid signature", 403)
+		return
+	}
 	id := r.PathValue("id")
 	p, err := s.Store.Project(id)
 	if err != nil {

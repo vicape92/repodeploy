@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -118,20 +119,70 @@ func TestLoginLimiterEscalatesAndResetsOnSuccess(t *testing.T) {
 	}
 }
 
-func TestLoginLimiterGlobalCeiling(t *testing.T) {
+func TestLoginLimiterDoesNotLetOtherNetworksLockOutFreshClients(t *testing.T) {
 	l := newLoginLimiter()
-	now := time.Unix(1_700_000_000, 0)
-	l.now = func() time.Time { return now }
-	for i := 0; i < loginGlobalWindow; i++ {
-		if _, ok := l.allow(strings.Repeat("x", i+1)); !ok {
-			t.Fatalf("attempt %d refused early", i)
+	for i := 0; i < 40; i++ {
+		client := fmt.Sprintf("198.51.100.%d", i)
+		l.allow(client)
+		l.result(client, false)
+	}
+	if _, ok := l.allow("203.0.113.100"); !ok {
+		t.Fatal("other networks exhausted the administrator's login budget")
+	}
+}
+
+func TestLoginLimiterSharesIPv6SubnetBudget(t *testing.T) {
+	l := newLoginLimiter()
+	for i := 0; i < loginPerIPWindow; i++ {
+		if _, ok := l.allow(fmt.Sprintf("2001:db8:1::%x", i)); !ok {
+			t.Fatal("attempt rejected early")
 		}
 	}
-	if _, ok := l.allow("fresh"); ok {
-		t.Fatal("global ceiling not enforced")
+	if _, ok := l.allow("2001:db8:1::ffff"); ok {
+		t.Fatal("IPv6 address rotation bypassed the subnet limit")
 	}
-	now = now.Add(loginWindow + time.Second)
-	if _, ok := l.allow("fresh"); !ok {
-		t.Fatal("global window did not slide")
+	if _, ok := l.allow("2001:db8:2::1"); !ok {
+		t.Fatal("another subnet was blocked")
+	}
+}
+
+func TestLoginLimiterFullTableDoesNotRejectAllNewClients(t *testing.T) {
+	l := newLoginLimiter()
+	for i := 0; i < loginMaxClients; i++ {
+		l.allow(fmt.Sprintf("client-%d", i))
+	}
+	if _, ok := l.allow("administrator"); !ok {
+		t.Fatal("full client table blocks every new client")
+	}
+	if len(l.clients) > loginMaxClients {
+		t.Fatal("client tracking is unbounded")
+	}
+}
+
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (r *deadlineRecorder) SetReadDeadline(at time.Time) error {
+	r.deadlines = append(r.deadlines, at)
+	return nil
+}
+func TestBodylessRequestsDoNotInstallReadDeadline(t *testing.T) {
+	s, _, _ := webFixture(t)
+	w := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	s.Handler().ServeHTTP(w, httptest.NewRequest("GET", "http://localhost/login", nil))
+	if len(w.deadlines) != 0 {
+		t.Fatal("bodyless request inherits a deadline that can cancel long-lived responses")
+	}
+}
+func TestFormReadClearsBodyDeadlineBeforeVerification(t *testing.T) {
+	s, _, _ := webFixture(t)
+	w := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	r := httptest.NewRequest("POST", "http://localhost/login", strings.NewReader("password=incorrect-password"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.Handler().ServeHTTP(w, r)
+	if len(w.deadlines) < 2 || w.deadlines[0].IsZero() || !w.deadlines[1].IsZero() {
+		t.Fatal("body deadline missing or not cleared on EOF")
 	}
 }

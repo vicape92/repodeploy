@@ -385,6 +385,7 @@ func (d Docker) Build(ctx context.Context, p Project, source, dir string, log io
 	if err = writeJSON(buildPath, cfg); err != nil {
 		return "", err
 	}
+	maskManifest(log, buildPath)
 	if err = d.compose(ctx, p, buildPath, log, buildArgs(p)...); err != nil {
 		return "", errors.New("Docker build failed; see deployment logs")
 	}
@@ -548,38 +549,54 @@ func (d Docker) Healthy(ctx context.Context, p Project, path string, log io.Writ
 	}
 	services := mapKeys(cfg["services"])
 	for ctx.Err() == nil {
-		ready := true
-		for _, service := range services {
-			var out bytes.Buffer
-			if err = d.compose(ctx, p, path, &out, "ps", "--all", "--quiet", service); err != nil {
-				ready = false
-				break
-			}
-			ids := strings.Fields(out.String())
-			if len(ids) == 0 {
-				ready = false
-				break
-			}
-			for _, id := range ids {
-				state, err := dockerOutput(ctx, "inspect", "--format", "{{json .State}}", id)
+		var out bytes.Buffer
+		ready := d.compose(ctx, p, path, &out, "ps", "--all", "--format", "json") == nil
+		var states []struct{ Service, State, Health string }
+		if ready {
+			decoder := json.NewDecoder(&out)
+			for {
+				var raw json.RawMessage
+				err := decoder.Decode(&raw)
+				if err == io.EOF {
+					break
+				}
 				if err != nil {
 					ready = false
 					break
 				}
-				var st struct {
-					Status string
-					Health *struct{ Status string }
+				if len(raw) > 0 && raw[0] == '[' {
+					var page []struct{ Service, State, Health string }
+					if json.Unmarshal(raw, &page) != nil {
+						ready = false
+						break
+					}
+					states = append(states, page...)
+				} else {
+					var state struct{ Service, State, Health string }
+					if json.Unmarshal(raw, &state) != nil {
+						ready = false
+						break
+					}
+					states = append(states, state)
 				}
-				if json.Unmarshal(state, &st) != nil {
-					ready = false
-					break
-				}
-				if st.Status == "exited" || st.Status == "dead" {
-					return fmt.Errorf("service %s exited before becoming healthy", service)
-				}
-				if st.Status != "running" || (st.Health != nil && st.Health.Status != "healthy") || (p.HealthURL == "" && service == p.HealthService && st.Health == nil) {
-					ready = false
-				}
+			}
+		}
+		seen := make(map[string]bool, len(services))
+		for _, state := range states {
+			if _, ok := cfg["services"].(map[string]any)[state.Service]; !ok {
+				continue
+			}
+			seen[state.Service] = true
+			if state.State == "exited" || state.State == "dead" {
+				return fmt.Errorf("service %s exited before becoming healthy", state.Service)
+			}
+			if state.State != "running" || (state.Health != "" && state.Health != "healthy") || (p.HealthURL == "" && state.Service == p.HealthService && state.Health == "") {
+				ready = false
+			}
+		}
+		for _, service := range services {
+			if !seen[service] {
+				ready = false
 			}
 		}
 		if ready && p.HealthURL != "" {
