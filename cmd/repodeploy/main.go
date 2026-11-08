@@ -47,6 +47,8 @@ Usage: repodeploy [--state DIR] [--url URL] [--token-file FILE] COMMAND
                                    Store a variable; the value is read from stdin
   env unset ID NAME                Delete a variable
   env import ID FILE|-             Store every variable of a .env file
+  up [--project ID] [--force] [--detach] [DIR]
+                                   Upload DIR (default .) to an upload project and deploy
   rollback ID RELEASE_ID           Restore a retained release; pause automation
   resume ID                        Resume automation after rollback
   history ID                       Show deployment history
@@ -168,6 +170,10 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 	token, err := readToken(*tokenFile)
 	if err != nil {
 		return err
+	}
+	if args[0] == "up" {
+		client := apiClient{base: *apiURL, token: strings.TrimSpace(string(token)), http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+		return up(ctx, client, args[1:], out)
 	}
 	method, path := http.MethodGet, ""
 	var body []byte
@@ -348,23 +354,7 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 		return fmt.Errorf("daemon returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	if follow {
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 4096), 8<<20)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "data: ") {
-				var event struct {
-					Log string `json:"log"`
-				}
-				if err = json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
-					return err
-				}
-				if _, err = io.WriteString(out, event.Log); err != nil {
-					return err
-				}
-			}
-		}
-		return scanner.Err()
+		return streamLogs(resp.Body, out)
 	}
 	if strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
 		b, err := io.ReadAll(resp.Body)
@@ -586,4 +576,26 @@ func parseSize(s string) (int64, error) {
 		return 0, errors.New("--max-upload must be at least 1MB")
 	}
 	return n * factor, nil
+}
+
+// streamLogs prints the log text of a server-sent event stream.
+func streamLogs(r io.Reader, out io.Writer) error {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 4096), 8<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var event struct {
+			Log string `json:"log"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(out, event.Log); err != nil {
+			return err
+		}
+	}
+	return scanner.Err()
 }
