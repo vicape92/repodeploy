@@ -134,6 +134,16 @@ ExecStart=/usr/local/bin/repodeploy --state /var/lib/repodeploy serve --listen 1
 Example Nginx location inside an HTTPS server block:
 
 ```nginx
+# Project uploads (panel and `repodeploy up`).
+location ~ ^/(api/)?projects/[^/]+/uploads$ {
+    proxy_pass http://127.0.0.1:8081;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_request_buffering off;      # stream archives straight to RepoDeploy
+    proxy_read_timeout 600s;
+    client_max_body_size 200m;        # at least serve --max-upload
+}
+
 location / {
     proxy_pass http://127.0.0.1:8081;
     proxy_set_header Host $host;
@@ -152,6 +162,10 @@ location /hooks/github/ {
 }
 ```
 
+The upload location needs a `client_max_body_size` at least as large as
+`serve --max-upload` (default 200MB); otherwise nginx answers `413` before
+RepoDeploy sees the archive.
+
 Do not expose port `8081` directly to untrusted networks. A non-loopback bind
 requires `--public-url https://...`, but the application itself still serves HTTP;
 you must actually provide TLS termination. Browser writes require CSRF tokens;
@@ -161,7 +175,9 @@ With `--public-url` the panel also sends `Strict-Transport-Security` and names i
 session cookie `__Host-repodeploy_session` (provider-connection cookies use the
 `__Secure-` prefix), so browsers only accept them over HTTPS and a sibling
 subdomain cannot overwrite them. Webhook bodies may be up to 25 MiB (GitHub's
-limit); other requests are limited to 1 MiB.
+limit); project uploads accept up to `--max-upload` (default 200 MB), at most two
+at a time (`429` with `Retry-After` otherwise); other requests are limited to
+1 MiB.
 
 **Host validation.** The panel answers only requests whose `Host` is `localhost`,
 a loopback address, or the host of `--public-url`; anything else receives

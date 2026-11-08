@@ -554,8 +554,8 @@ prototypes, code that is not on a Git host, or a quick test.
 What is sent: inside a Git work tree, the files `git ls-files` reports (tracked
 files and untracked files not ignored by `.gitignore`); elsewhere every file
 except `.git/`. Patterns in `.repodeployignore` (gitignore subset: `*`, `?`,
-`**`, `dir/`, `/anchored`, `!negation`) are excluded too. `.env` and `.env.*`
-files are never sent; store their values as
+`**`, `dir/`, `/anchored`, `!negation`) are excluded too. `.repodeploy/`, `.envrc`, `.env` and
+`.env.*` files are never sent; store their values as
 [environment variables](#environment-variables).
 
 Upload projects have no polling, webhooks or CI/CD gate. Each archive is
@@ -563,7 +563,9 @@ validated (no absolute paths, `..`, links leaving the archive, devices or hard
 links), limited to 200 MB by default (`serve --max-upload`) and stored under
 its SHA-256, so history, rollback and **Deploy changes** work as for Git
 projects. If the archive holds a single top-level folder, its contents become
-the project root.
+the project root. Panel uploads stream straight into the state directory, and
+at most two uploads are processed at once. The archive hash appears in the
+job's `commit` field in the API (labelled `upload` in the panel history).
 
 Details: [browser and SSH connections](docs/installation.md#browser-and-ssh-connections).
 
@@ -777,7 +779,7 @@ they combine well with `jq`.
 | `--public-url` | External HTTPS URL behind a reverse proxy; enables HSTS and secure cookies |
 | `--trust-proxy` | Identify clients by `X-Forwarded-For` from a loopback proxy |
 | `--allowed-hosts` | Extra `Host` names the panel accepts |
-| `--max-upload` | Largest accepted upload archive, e.g. `200MB` (default) or `1GB` |
+| `--max-upload` | Largest accepted upload archive, e.g. `200MB` (default) or `1GB`; minimum `1MB` |
 
 ### Everyday recipes
 
@@ -865,7 +867,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/projects
 | `PUT /api/projects/{id}/env` | Upsert variables: `[{"name": "…", "value": "…", "build": true}]` |
 | `DELETE /api/projects/{id}/env/{name}` | Delete a variable |
 | `POST /api/projects/{id}/deploy-changes` | Redeploy the active release with current variables (`202`; `409` when nothing is deployed) |
-| `POST /api/projects/{id}/uploads[?force=1]` | Upload an archive (raw body, `application/octet-stream`): `202` queued, `200` already active, `413` too large |
+| `POST /api/projects/{id}/uploads[?force=1]` | Upload an archive (raw body, `application/octet-stream`): `202` queued, `200` already active, `413` too large, `429` (with `Retry-After`) when two uploads are already being processed |
 | `POST /api/projects/{id}/webhook-secret` | Rotate the webhook secret |
 | `GET /api/jobs/{id}` | Get a deployment |
 | `GET /api/jobs/{id}/logs[?follow=1]` | Log as text, or as a Server-Sent Events stream |
@@ -899,6 +901,15 @@ ExecStart=/usr/local/bin/repodeploy --state /var/lib/repodeploy serve --listen 1
 Nginx example:
 
 ```nginx
+# Project uploads (panel and `repodeploy up`).
+location ~ ^/(api/)?projects/[^/]+/uploads$ {
+    proxy_pass http://127.0.0.1:8081;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_request_buffering off;      # stream archives straight to RepoDeploy
+    proxy_read_timeout 600s;
+    client_max_body_size 200m;        # at least serve --max-upload
+}
 location / {
     proxy_pass http://127.0.0.1:8081;
     proxy_set_header Host $host;
@@ -914,6 +925,10 @@ location /hooks/github/ {
     client_max_body_size 25m;         # GitHub push payloads
 }
 ```
+
+The upload location must come with a `client_max_body_size` at least as large
+as `serve --max-upload` (default 200MB); otherwise nginx answers `413` before
+RepoDeploy sees the archive.
 
 With `--public-url`, RepoDeploy sends HSTS and uses `__Host-` cookies. Requests
 with an unexpected `Host` header get `421`; add extra names with

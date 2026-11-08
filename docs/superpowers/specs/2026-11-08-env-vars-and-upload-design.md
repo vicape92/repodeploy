@@ -143,7 +143,7 @@ exposes a small API; no other package reads or writes that data directly.
   ports, health check, retention and variables work as today.
 - Job identity: the upload's content hash is stored in the existing `sha`
   column; jobs created by an upload have `source="upload"`. The API exposes the
-  hash as `upload` for upload projects, and history shows `upload <first 12 hex>`
+  hash in the job's `commit` field (labelled "upload" in the panel), and history shows `upload <first 12 hex>`
   where Git projects show the commit. No SQLite schema change; `user_version`
   stays 1.
 

@@ -145,7 +145,9 @@ The state directory contains `state.db`, SQLite WAL files, `engine.lock`, protec
 administrator credentials, `secrets/` (including `<project>.env.json` variable
 files), `releases/JOB_ID/`, `logs/JOB_ID.log` and `uploads/<project>/<sha256>.tar.gz`
 (normalised upload archives; `uploads/tmp/` holds in-flight files, swept after
-24 hours). An upload archive is kept while any retained release references it.
+24 hours). An upload archive is kept while any retained release references it, and a
+freshly stored archive is kept for at least one hour before retention can
+delete it.
 `serve --max-upload` (default 200MB) caps archives; extraction is capped at five
 times that size and 50 000 entries. Backups include `uploads/` except `tmp/`.
 Never put this directory inside a Git checkout. Do not share it between hosts or
