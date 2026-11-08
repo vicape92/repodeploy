@@ -64,7 +64,7 @@ func extract(archive, dest string, lim Limits) error {
 	if _, err = f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	if err = os.Mkdir(dest, 0755); err != nil {
+	if err = mkdir(dest); err != nil {
 		return err
 	}
 	x := &extractor{root: dest, lim: lim}
@@ -87,7 +87,13 @@ func (x *extractor) zip(r io.ReaderAt, size int64) error {
 	if err != nil {
 		return invalid("the zip archive is damaged: %v", err)
 	}
+	if len(zr.File) > x.lim.MaxEntries {
+		return invalid("the archive has more than %d entries", x.lim.MaxEntries)
+	}
 	for _, f := range zr.File {
+		if err = x.count(); err != nil {
+			return err
+		}
 		mode := f.Mode()
 		switch {
 		case mode.IsDir():
@@ -130,14 +136,22 @@ func (x *extractor) tarGz(r io.Reader) error {
 		return invalid("the tar.gz archive is damaged: %v", err)
 	}
 	defer gz.Close()
-	tr := tar.NewReader(gz)
+	// Headers and padding are not counted as written bytes, so allow headroom.
+	tr := tar.NewReader(&expandedReader{r: gz, left: x.lim.MaxExpanded + int64(x.lim.MaxEntries)*2048 + 1<<20, max: x.lim.MaxExpanded})
 	for {
 		h, err := tr.Next()
 		if err == io.EOF {
 			return nil
 		}
 		if err != nil {
+			var limit *Error
+			if errors.As(err, &limit) {
+				return limit
+			}
 			return invalid("the tar.gz archive is damaged: %v", err)
+		}
+		if err = x.count(); err != nil {
+			return err
 		}
 		switch h.Typeflag {
 		case tar.TypeDir:
@@ -157,11 +171,51 @@ func (x *extractor) tarGz(r io.Reader) error {
 	}
 }
 
+// expandedReader fails once more than its budget has been read, so ignored
+// entries cannot make the extraction decompress without bound.
+type expandedReader struct {
+	r    io.Reader
+	left int64
+	max  int64
+}
+
+func (e *expandedReader) Read(p []byte) (int, error) {
+	if e.left < 0 {
+		return 0, invalid("the archive expands to more than %d MB", e.max>>20)
+	}
+	if int64(len(p)) > e.left+1 {
+		p = p[:e.left+1]
+	}
+	n, err := e.r.Read(p)
+	e.left -= int64(n)
+	if e.left < 0 {
+		return 0, invalid("the archive expands to more than %d MB", e.max>>20)
+	}
+	return n, err
+}
+
+// count registers an archive entry, skipped ones included.
+func (x *extractor) count() error {
+	x.entries++
+	if x.entries > x.lim.MaxEntries {
+		return invalid("the archive has more than %d entries", x.lim.MaxEntries)
+	}
+	return nil
+}
+
+// mkdir creates a directory with mode 0755 regardless of the umask.
+func mkdir(p string) error {
+	if err := os.Mkdir(p, 0755); err != nil {
+		return err
+	}
+	return os.Chmod(p, 0755)
+}
+
 // clean validates an entry name and returns its slash-separated relative
 // path, or "" for entries that are skipped.
 func clean(name string) (string, error) {
 	name = strings.ReplaceAll(name, `\`, "/")
-	if strings.HasPrefix(name, "/") || (len(name) > 1 && name[1] == ':') {
+	if strings.HasPrefix(name, "/") || isDriveLetterPath(name) {
 		return "", invalid("%s uses an absolute path", name)
 	}
 	cleaned := path.Clean(name)
@@ -174,21 +228,30 @@ func clean(name string) (string, error) {
 	return cleaned, nil
 }
 
-// prepare counts the entry, creates missing parent directories and refuses
+// isDriveLetterPath matches Windows drive paths such as "C:/x" or "C:", but not
+// POSIX names like "a:b.txt".
+func isDriveLetterPath(name string) bool {
+	if len(name) < 2 || name[1] != ':' {
+		return false
+	}
+	c := name[0]
+	if !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') {
+		return false
+	}
+	return len(name) == 2 || name[2] == '/'
+}
+
+// prepare creates missing parent directories and refuses
 // to write through an existing symlink, so a link created by an earlier
 // entry can never redirect a later one outside the root.
 func (x *extractor) prepare(rel string) (string, error) {
-	x.entries++
-	if x.entries > x.lim.MaxEntries {
-		return "", invalid("the archive has more than %d entries", x.lim.MaxEntries)
-	}
 	parts := strings.Split(rel, "/")
 	current := x.root
 	for _, part := range parts[:len(parts)-1] {
 		current = filepath.Join(current, part)
 		info, err := os.Lstat(current)
 		if errors.Is(err, fs.ErrNotExist) {
-			if err = os.Mkdir(current, 0755); err != nil {
+			if err = mkdir(current); err != nil {
 				return "", err
 			}
 			continue
@@ -222,7 +285,7 @@ func (x *extractor) dir(name string) error {
 		}
 		return invalid("%s appears twice in the archive", rel)
 	}
-	return os.Mkdir(target, 0755)
+	return mkdir(target)
 }
 
 func (x *extractor) file(name string, r io.Reader, mode fs.FileMode) error {
@@ -286,6 +349,13 @@ func (x *extractor) symlink(name, target string) error {
 // relative to root): sorted entries, zero timestamps and owners, and modes
 // reduced to 0755/0644. Symlinks must stay inside root.
 func Pack(root string, files []string, w io.Writer) error {
+	if err := findEscape(root); err != nil {
+		var e *escapeError
+		if errors.As(err, &e) {
+			return fmt.Errorf("symlink %s points outside the project", e.rel)
+		}
+		return err
+	}
 	sorted := append([]string{}, files...)
 	sort.Strings(sorted)
 	gz := gzip.NewWriter(w)
@@ -338,4 +408,43 @@ func Pack(root string, files []string, w io.Writer) error {
 		return err
 	}
 	return gz.Close()
+}
+
+// escapeError reports a symlink that resolves outside the tree.
+type escapeError struct{ rel string }
+
+func (e *escapeError) Error() string { return "symlink " + e.rel + " points outside the tree" }
+
+// findEscape resolves every symlink below root with os.Root, which refuses
+// any path that leaves the root, however the links are chained. Dangling
+// links are harmless; any other failure is an escape or a loop.
+func findEscape(root string) error {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.Type()&fs.ModeSymlink == 0 {
+			return err
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		if _, err = r.Stat(rel); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return &escapeError{rel: filepath.ToSlash(rel)}
+		}
+		return nil
+	})
+}
+
+// checkLinks rejects trees containing a symlink that resolves outside root.
+func checkLinks(root string) error {
+	err := findEscape(root)
+	var e *escapeError
+	if errors.As(err, &e) {
+		return invalid("symlink %s points outside the archive", e.rel)
+	}
+	return err
 }

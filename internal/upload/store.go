@@ -38,6 +38,9 @@ func (s *Store) path(projectID, hash string) string {
 // Save validates the archive, normalises it and stores it, returning the
 // SHA-256 of the normalised archive. Nothing remains on disk on error.
 func (s *Store) Save(projectID, archive string, lim Limits) (string, error) {
+	if !validProjectID(projectID) {
+		return "", errors.New("invalid project ID")
+	}
 	tmp, err := s.TempDir()
 	if err != nil {
 		return "", err
@@ -52,6 +55,9 @@ func (s *Store) Save(projectID, archive string, lim Limits) (string, error) {
 		return "", err
 	}
 	if tree, err = singleRoot(tree); err != nil {
+		return "", err
+	}
+	if err = checkLinks(tree); err != nil {
 		return "", err
 	}
 	files, err := listTree(tree)
@@ -121,6 +127,9 @@ func listTree(root string) ([]string, error) {
 // Prepare extracts a stored archive into dest, replacing anything a previous
 // interrupted attempt left there.
 func (s *Store) Prepare(projectID, hash, dest string) error {
+	if !validProjectID(projectID) {
+		return errors.New("invalid project ID")
+	}
 	if !ValidHash(hash) {
 		return errors.New("invalid upload identifier")
 	}
@@ -131,12 +140,22 @@ func (s *Store) Prepare(projectID, hash, dest string) error {
 	if err := os.RemoveAll(dest); err != nil {
 		return err
 	}
-	return extract(archive, dest, unlimited)
+	if err := extract(archive, dest, unlimited); err != nil {
+		return err
+	}
+	if err := checkLinks(dest); err != nil {
+		os.RemoveAll(dest)
+		return err
+	}
+	return nil
 }
 
 // Prune removes the project's archives that keep does not list, except those
 // modified within minAge: their deployment may not be queued yet.
 func (s *Store) Prune(projectID string, keep map[string]bool, minAge time.Duration) error {
+	if !validProjectID(projectID) {
+		return errors.New("invalid project ID")
+	}
 	paths, err := filepath.Glob(filepath.Join(s.root, projectID, "*.tar.gz"))
 	if err != nil {
 		return err
@@ -154,9 +173,15 @@ func (s *Store) Prune(projectID string, keep map[string]bool, minAge time.Durati
 	return nil
 }
 
+// validProjectID rejects IDs that could name the temp directory or escape the
+// store.
+func validProjectID(id string) bool {
+	return id != "" && id != "tmp" && !strings.ContainsAny(id, `/\.`)
+}
+
 // DeleteProject removes every archive of a project.
 func (s *Store) DeleteProject(projectID string) error {
-	if projectID == "" || projectID == "tmp" || strings.ContainsAny(projectID, `/\.`) {
+	if !validProjectID(projectID) {
 		return errors.New("invalid project ID")
 	}
 	return os.RemoveAll(filepath.Join(s.root, projectID))

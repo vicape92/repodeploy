@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -153,6 +154,9 @@ func TestSaveRejectsUnsafeArchivesAndLeavesNothing(t *testing.T) {
 		"duplicate":      tgz(t, entry{name: "f", body: "x"}, entry{name: "f", body: "y"}),
 		"too large":      tgz(t, entry{name: "big", body: strings.Repeat("x", 2048)}),
 		"too many":       tgz(t, entry{name: "1", body: "x"}, entry{name: "2", body: "x"}, entry{name: "3", body: "x"}, entry{name: "4", body: "x"}, entry{name: "5", body: "x"}, entry{name: "6", body: "x"}),
+		"symlink chain":  tgz(t, chainEntries()...),
+		"ignored count":  tgz(t, append(ignoredEntries(10), entry{name: "f", body: "x"})...),
+		"ignored big":    tgz(t, entry{name: "__MACOSX/big", body: strings.Repeat("x", 2<<20)}, entry{name: "f", body: "x"}),
 		"empty":          tgz(t),
 		"not an archive": plainFile(t, "plain text"),
 	}
@@ -253,5 +257,98 @@ func TestPackIsDeterministicAndRejectsOutsideSymlinks(t *testing.T) {
 	os.Symlink("../outside", filepath.Join(root, "bad"))
 	if err := Pack(root, []string{"a", "bad"}, io.Discard); err == nil {
 		t.Fatal("escaping symlink packed")
+	}
+}
+
+// chainEntries builds a 40-deep directory D, a link D/l back to the root that
+// is lexically ".", and a link that uses it to climb out of the root.
+func chainEntries() []entry {
+	deep := strings.TrimSuffix(strings.Repeat("d/", 40), "/")
+	return []entry{
+		{name: deep + "/", kind: tar.TypeDir},
+		{name: deep + "/l", link: strings.TrimSuffix(strings.Repeat("../", 40), "/"), kind: tar.TypeSymlink},
+		{name: "passwd", link: deep + "/l/" + strings.Repeat("../", 41) + "etc/passwd", kind: tar.TypeSymlink},
+	}
+}
+
+func ignoredEntries(n int) []entry {
+	var out []entry
+	for i := 0; i < n; i++ {
+		out = append(out, entry{name: "__MACOSX/" + strings.Repeat("a", i+1), body: "x"})
+	}
+	return out
+}
+
+func TestSaveFlatteningTurnsInternalLinkIntoAnEscapeError(t *testing.T) {
+	s := New(t.TempDir())
+	_, err := s.Save("p1", tgz(t,
+		entry{name: "app/x", body: "x"},
+		entry{name: "app/l", link: "../app/x", kind: tar.TypeSymlink}), DefaultLimits(DefaultMaxBytes))
+	var invalid *Error
+	if !errors.As(err, &invalid) {
+		t.Fatalf("expected *upload.Error, got %v", err)
+	}
+}
+
+func TestPrepareCreatesWorldReadableDirectoriesUnderRestrictiveUmask(t *testing.T) {
+	s := New(t.TempDir())
+	hash, err := s.Save("p1", tgz(t, entry{name: "top", body: "x"}, entry{name: "sub/deep/f", body: "x"}), DefaultLimits(DefaultMaxBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := syscall.Umask(0077)
+	defer syscall.Umask(old)
+	dest := filepath.Join(t.TempDir(), "src")
+	if err := s.Prepare("p1", hash, dest); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{dest, filepath.Join(dest, "sub"), filepath.Join(dest, "sub", "deep")} {
+		info, err := os.Stat(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0755 {
+			t.Fatalf("%s: %v", d, info.Mode())
+		}
+	}
+}
+
+func TestSaveAcceptsColonInNames(t *testing.T) {
+	s := New(t.TempDir())
+	if _, err := s.Save("p1", tgz(t, entry{name: "a:b.txt", body: "x"}), DefaultLimits(DefaultMaxBytes)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Save("p1", tgz(t, entry{name: `C:\evil`, body: "x"}), DefaultLimits(DefaultMaxBytes)); err == nil {
+		t.Fatal("drive letter accepted")
+	}
+}
+
+func TestPackRejectsChainedEscapingSymlink(t *testing.T) {
+	root := t.TempDir()
+	deep := strings.TrimSuffix(strings.Repeat("d/", 40), "/")
+	if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(deep)), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.Symlink(strings.TrimSuffix(strings.Repeat("../", 40), "/"), filepath.Join(root, filepath.FromSlash(deep), "l"))
+	os.Symlink(deep+"/l/"+strings.Repeat("../", 41)+"etc/passwd", filepath.Join(root, "passwd"))
+	err := Pack(root, []string{"passwd"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "points outside the project") {
+		t.Fatalf("chained escape packed: %v", err)
+	}
+}
+
+func TestProjectIDValidation(t *testing.T) {
+	s := New(t.TempDir())
+	archive := tgz(t, entry{name: "f", body: "x"})
+	for _, id := range []string{"", "tmp", "a/b", `a\b`, "..", "a.b"} {
+		if _, err := s.Save(id, archive, DefaultLimits(DefaultMaxBytes)); err == nil {
+			t.Fatalf("Save accepted %q", id)
+		}
+		if err := s.Prepare(id, strings.Repeat("a", 64), filepath.Join(t.TempDir(), "x")); err == nil {
+			t.Fatalf("Prepare accepted %q", id)
+		}
+		if err := s.Prune(id, nil, 0); err == nil {
+			t.Fatalf("Prune accepted %q", id)
+		}
 	}
 }
