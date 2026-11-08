@@ -43,7 +43,19 @@ func (s *Server) projectView(p deploy.Project) (page, error) {
 	if err != nil {
 		return page{}, errors.New("cannot read secrets")
 	}
-	return page{View: "project", Project: p, Jobs: jobs, Secrets: secrets}, nil
+	vars, err := s.Store.Env.List(p.ID)
+	if err != nil {
+		return page{}, errors.New("cannot read variables")
+	}
+	pending, err := s.Store.EnvPending(p)
+	if err != nil {
+		return page{}, errors.New("cannot compare variables with the active release")
+	}
+	rows := make([]envRow, 0, len(vars))
+	for _, v := range vars {
+		rows = append(rows, envRow{Name: v.Name, Build: v.Build})
+	}
+	return page{View: "project", Project: p, Jobs: jobs, Secrets: secrets, EnvRows: rows, EnvPending: pending}, nil
 }
 
 func (s *Server) deletePage(w http.ResponseWriter, r *http.Request) {

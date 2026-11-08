@@ -107,6 +107,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/projects/{id}/secrets/{name}", s.secret)
 	mux.HandleFunc("GET /api/projects/{id}/secrets", s.secretsList)
 	mux.HandleFunc("DELETE /api/projects/{id}/secrets/{name}", s.deleteSecret)
+	mux.HandleFunc("GET /api/projects/{id}/env", s.envList)
+	mux.HandleFunc("PUT /api/projects/{id}/env", s.envSet)
+	mux.HandleFunc("DELETE /api/projects/{id}/env/{name}", s.envDelete)
+	mux.HandleFunc("POST /api/projects/{id}/deploy-changes", s.deployChanges)
 	mux.HandleFunc("DELETE /api/projects/{id}", s.deleteProject)
 	mux.HandleFunc("POST /api/projects/{id}/webhook-secret", s.webhookSecret)
 	mux.HandleFunc("GET /api/jobs/{id}", s.job)
@@ -124,6 +128,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /projects/{id}/delete", s.deleteProject)
 	mux.HandleFunc("POST /projects/{id}/secrets", s.saveSecretForm)
 	mux.HandleFunc("POST /projects/{id}/secrets/{name}/delete", s.deleteSecret)
+	mux.HandleFunc("POST /projects/{id}/env", s.envSaveForm)
+	mux.HandleFunc("POST /projects/{id}/env/import", s.envImportForm)
+	mux.HandleFunc("POST /projects/{id}/env/{name}/reveal", s.envReveal)
+	mux.HandleFunc("POST /projects/{id}/env/{name}/delete", s.envDelete)
+	mux.HandleFunc("POST /projects/{id}/deploy-changes", s.deployChanges)
 	mux.Handle("GET /static/", staticHandler())
 	mux.HandleFunc("POST /logout", s.logout)
 	mux.HandleFunc("GET /settings", s.settings)
@@ -722,6 +731,10 @@ type page struct {
 	SecretError    string
 	Latest         map[string]deploy.Job
 	Refresh        bool
+	EnvRows        []envRow
+	EnvPending     bool
+	EnvError       string
+	EnvName        string
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, p page) {
