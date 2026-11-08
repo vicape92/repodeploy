@@ -23,6 +23,7 @@ func ParseDotEnv(text string) ([]Update, error) {
 		if !ok || !ValidName(name) {
 			return nil, fmt.Errorf("line %d: expected NAME=value with a valid name", n+1)
 		}
+		spaced := strings.HasPrefix(value, " ") || strings.HasPrefix(value, "\t")
 		value = strings.TrimSpace(value)
 		switch {
 		case strings.HasPrefix(value, `"`):
@@ -47,7 +48,7 @@ func ParseDotEnv(text string) ([]Update, error) {
 				return nil, fmt.Errorf("line %d: unexpected text after the closing quote", n+1)
 			}
 			value = value[1:end]
-		case strings.HasPrefix(value, "#"):
+		case spaced && strings.HasPrefix(value, "#"):
 			value = ""
 		default:
 			if i := strings.Index(value, " #"); i >= 0 {

@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseDotEnv(t *testing.T) {
-	text := "# comment\r\n\nexport API_URL=https://api.example.org\nPLAIN = value with spaces # trailing comment\nHASH=abc#def\nSINGLE='literal $HOME \\n'\nDOUBLE=\"line1\\nline2 \\\"quoted\\\"\"\nEMPTY=\nCOMMENTED= # nothing here\nQD=\"a b\" # note\nQS='x y'   # note\nQE=\"a \\\" # b\"\n"
+	text := "# comment\r\n\nexport API_URL=https://api.example.org\nPLAIN = value with spaces # trailing comment\nHASH=abc#def\nSINGLE='literal $HOME \\n'\nDOUBLE=\"line1\\nline2 \\\"quoted\\\"\"\nEMPTY=\nCOLOR=#ff0000\nexport B=#x\nCOMMENTED= # nothing here\nQD=\"a b\" # note\nQS='x y'   # note\nQE=\"a \\\" # b\"\n"
 	got, err := ParseDotEnv(text)
 	if err != nil {
 		t.Fatal(err)
@@ -18,6 +18,8 @@ func TestParseDotEnv(t *testing.T) {
 		{Name: "SINGLE", Value: `literal $HOME \n`},
 		{Name: "DOUBLE", Value: "line1\nline2 \"quoted\""},
 		{Name: "EMPTY", Value: ""},
+		{Name: "COLOR", Value: "#ff0000"},
+		{Name: "B", Value: "#x"},
 		{Name: "COMMENTED", Value: ""},
 		{Name: "QD", Value: "a b"},
 		{Name: "QS", Value: "x y"},
