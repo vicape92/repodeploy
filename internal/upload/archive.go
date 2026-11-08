@@ -349,13 +349,11 @@ func (x *extractor) symlink(name, target string) error {
 // relative to root): sorted entries, zero timestamps and owners, and modes
 // reduced to 0755/0644. Symlinks must stay inside root.
 func Pack(root string, files []string, w io.Writer) error {
-	if err := findEscape(root); err != nil {
-		var e *escapeError
-		if errors.As(err, &e) {
-			return fmt.Errorf("symlink %s points outside the project", e.rel)
-		}
+	r, err := os.OpenRoot(root)
+	if err != nil {
 		return err
 	}
+	defer r.Close()
 	sorted := append([]string{}, files...)
 	sort.Strings(sorted)
 	gz := gzip.NewWriter(w)
@@ -378,6 +376,9 @@ func Pack(root string, files []string, w io.Writer) error {
 			target = filepath.ToSlash(target)
 			resolved := path.Clean(path.Join(path.Dir(rel), target))
 			if path.IsAbs(target) || resolved == ".." || strings.HasPrefix(resolved, "../") {
+				return fmt.Errorf("symlink %s points outside the project", rel)
+			}
+			if _, err = r.Stat(filepath.FromSlash(rel)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				return fmt.Errorf("symlink %s points outside the project", rel)
 			}
 			h.Typeflag, h.Linkname, h.Mode = tar.TypeSymlink, target, 0777

@@ -352,3 +352,17 @@ func TestProjectIDValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestPackIgnoresEscapingSymlinksInUnlistedPaths(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "a"), []byte("x"), 0600)
+	os.MkdirAll(filepath.Join(root, ".venv", "bin"), 0755)
+	os.Symlink("/usr/bin/python3", filepath.Join(root, ".venv", "bin", "python"))
+	deep := strings.TrimSuffix(strings.Repeat("d/", 40), "/")
+	os.MkdirAll(filepath.Join(root, filepath.FromSlash(deep)), 0755)
+	os.Symlink(strings.TrimSuffix(strings.Repeat("../", 40), "/"), filepath.Join(root, filepath.FromSlash(deep), "l"))
+	os.Symlink(deep+"/l/"+strings.Repeat("../", 41)+"etc/passwd", filepath.Join(root, "passwd"))
+	if err := Pack(root, []string{"a"}, io.Discard); err != nil {
+		t.Fatalf("unlisted symlinks inspected: %v", err)
+	}
+}
